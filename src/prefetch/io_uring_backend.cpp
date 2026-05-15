@@ -114,7 +114,7 @@ bool IoUringBackend::submit_prefetch(const std::vector<uint64_t> &node_ids) {
     }
     if (slot_idx < 0)
       break;
-    Slot &slot = impl_->slots[static_cast<size_t>(slot_idx)];
+    auto &slot = impl_->slots[static_cast<size_t>(slot_idx)];
     slot.busy = true;
     slot.node_id = id;
     const off_t off = static_cast<off_t>(amio::index::node_offset(id));

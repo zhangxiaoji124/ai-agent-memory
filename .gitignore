@@ -12,5 +12,8 @@ cmake-build-debug/
 *.exe
 logs/
 
+# 本地 bundle 备份（用于离线迁移）
+*.bundle
+
 # 本地生成的策略（可用 learning/train_agent_policy.py 重新生成）
 data/agent_io_policy.json
