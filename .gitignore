@@ -1,0 +1,16 @@
+# 本地下载的数据集（体积大）
+data/sift/
+data/sift.tar/
+data/*.tar.gz
+data/*.index
+data/sift_base.index
+
+# 构建产物与 IDE
+build/
+cmake-build-debug/
+.vscode/
+*.exe
+logs/
+
+# 本地生成的策略（可用 learning/train_agent_policy.py 重新生成）
+data/agent_io_policy.json

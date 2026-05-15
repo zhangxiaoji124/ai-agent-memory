@@ -1,0 +1,9 @@
+{
+  "agent_profile": "cursor",
+  "prefetch_depth_upper": 1,
+  "prefetch_depth_layer0": 2,
+  "max_neighbor_fanout_layer0": 24,
+  "use_layer_aware_prefetch": true,
+  "sort_prefetch_by_disk_offset": true,
+  "hot_insert_min_prior_misses": 2
+}

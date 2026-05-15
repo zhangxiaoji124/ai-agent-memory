@@ -1,0 +1,9 @@
+{
+  "agent_profile": "qwen-ai",
+  "prefetch_depth_upper": 2,
+  "prefetch_depth_layer0": 2,
+  "max_neighbor_fanout_layer0": 32,
+  "use_layer_aware_prefetch": false,
+  "sort_prefetch_by_disk_offset": false,
+  "hot_insert_min_prior_misses": 1
+}

@@ -1,0 +1,55 @@
+/*
+ * Copyright (c) Microsoft Corporation.
+ * Licensed under the MIT license.
+ */
+
+pub(crate) mod async_;
+pub(crate) mod disk;
+pub(crate) mod exhaustive;
+pub(crate) mod filters;
+pub(crate) mod save_and_load;
+
+pub(crate) fn register_inputs(
+    registry: &mut diskann_benchmark_runner::registry::Inputs,
+) -> anyhow::Result<()> {
+    async_::register_inputs(registry)?;
+    exhaustive::register_inputs(registry)?;
+    disk::register_inputs(registry)?;
+    filters::register_inputs(registry)?;
+    Ok(())
+}
+
+/// Construct an example input of type `Self`.
+pub(crate) trait Example {
+    fn example() -> Self;
+}
+
+// NOTE: The input registration and dispatching isn't prefect. It uses a pattern (like
+// the use of `'static` on the benchmark types) as a byproduct of older ways of doing
+// benchmark selection.
+//
+// In the future, these can be migrated to reduce this legacy cruft.
+macro_rules! as_input {
+    ($T:ty) => {
+        impl diskann_benchmark_runner::Input for $T {
+            fn tag() -> &'static str {
+                <$T>::tag()
+            }
+
+            fn try_deserialize(
+                serialized: &serde_json::Value,
+                checker: &mut diskann_benchmark_runner::Checker,
+            ) -> anyhow::Result<diskann_benchmark_runner::Any> {
+                checker.any(<$T as serde::Deserialize>::deserialize(serialized)?)
+            }
+
+            fn example() -> anyhow::Result<serde_json::Value> {
+                Ok(serde_json::to_value(
+                    <$T as $crate::inputs::Example>::example(),
+                )?)
+            }
+        }
+    };
+}
+
+use as_input;
