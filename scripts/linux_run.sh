@@ -47,7 +47,7 @@ Linux 运行脚本（agent-memory-io-cpp）
   help              显示本说明
   deps              自动识别发行版并安装 cmake、C++ 编译器、liburing 开发包、wget（需 sudo）
   fetch-sift        下载并解压 SIFT 到 data/sift/
-  policy            生成 data/agent_io_policy.json（需 python3）
+  policy            生成 data/agent_io_policy.json（优先用 data/sift/sift_learn.fvecs，否则合成轨迹）
   build             cmake 配置并编译（使用当前 CC/CXX）
   test              运行 run_tests
   bench             运行 bench_search 与 bench_write
@@ -72,28 +72,28 @@ run_apt_deps() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     have_cmd sudo || die "需要 root 或 sudo 以安装依赖"
     sudo apt-get update
-    sudo apt-get install -y build-essential cmake wget ca-certificates liburing-dev
+    sudo apt-get install -y build-essential cmake wget ca-certificates liburing-dev python3
   else
     apt-get update
-    apt-get install -y build-essential cmake wget ca-certificates liburing-dev
+    apt-get install -y build-essential cmake wget ca-certificates liburing-dev python3
   fi
 }
 
 run_dnf_deps() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     have_cmd sudo || die "需要 sudo"
-    sudo dnf install -y gcc gcc-c++ cmake wget ca-certificates liburing-devel make
+    sudo dnf install -y gcc gcc-c++ cmake wget ca-certificates liburing-devel make python3
   else
-    dnf install -y gcc gcc-c++ cmake wget ca-certificates liburing-devel make
+    dnf install -y gcc gcc-c++ cmake wget ca-certificates liburing-devel make python3
   fi
 }
 
 run_zypper_deps() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     have_cmd sudo || die "需要 sudo"
-    sudo zypper --non-interactive install gcc gcc-c++ cmake wget ca-certificates liburing-devel make
+    sudo zypper --non-interactive install gcc gcc-c++ cmake wget ca-certificates liburing-devel make python3
   else
-    zypper --non-interactive install gcc gcc-c++ cmake wget ca-certificates liburing-devel make
+    zypper --non-interactive install gcc gcc-c++ cmake wget ca-certificates liburing-devel make python3
   fi
 }
 
@@ -144,7 +144,15 @@ run_policy() {
     echo "已存在 data/agent_io_policy.json，跳过。"
     return 0
   fi
-  "$py" learning/train_agent_policy.py --profile cursor --out data/agent_io_policy.json
+  if [[ -f data/sift/sift_learn.fvecs ]]; then
+    echo "使用 learn 集: data/sift/sift_learn.fvecs 训练策略 JSON"
+    "$py" learning/train_agent_policy.py --profile cursor --out data/agent_io_policy.json \
+      --data-source learn-fvecs --learn-fvecs data/sift/sift_learn.fvecs
+  else
+    echo "未找到 data/sift/sift_learn.fvecs，使用合成轨迹生成策略（可先执行 fetch-sift）"
+    "$py" learning/train_agent_policy.py --profile cursor --out data/agent_io_policy.json \
+      --data-source synthetic
+  fi
 }
 
 run_build() {

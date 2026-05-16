@@ -2,23 +2,18 @@
 """
 离线学习 Agent 向量检索 I/O 访问模式，导出 C++ 运行时策略 JSON。
 
-建模典型 Agent（与赛题意见一致，均为**合成统计轨迹**，非厂商遥测）：
-  - cursor：IDE 内短上下文、多轮小步编辑 → 图遍历更「窄」、顺序局部性更强。
-  - qwen-ai：长对话、宽扇出、跳转更随机。
-  - qwen3：在「推理链局部连贯」与「工具/检索突发跳转」之间折中，扇出介于 cursor 与 qwen-ai。
+两种数据来源（--data-source）：
+  - synthetic：按 Agent 画像生成合成轨迹（原行为）。
+  - learn-fvecs：读取官方 learn 集（如 data/sift/sift_learn.fvecs），在向量上做多步
+    「随机候选池 + 近邻贪心游走」，统计 mean_fanout / seq_locality 等，再映射到策略 JSON。
 
-特征（由合成轨迹统计）：
-  mean_fanout, std_fanout, seq_locality_score, high_layer_share
-
-算法：
-  在合成数据上拟合 sklearn.tree.DecisionTreeClassifier（若已安装），
-  打印特征重要性；最终导出策略仍按 --profile 显式映射到可解释参数，
-  保证可复现、与答辩材料一致。
+建模典型 Agent（synthetic 模式，与赛题意见一致）：
+  - cursor / qwen-ai / qwen3：见各 _synthetic_*_trace。
 
 用法:
   python learning/train_agent_policy.py --profile cursor --out data/agent_io_policy.json
+  python learning/train_agent_policy.py --data-source learn-fvecs --learn-fvecs data/sift/sift_learn.fvecs
   python learning/train_agent_policy.py --profile qwen-ai --out data/agent_io_policy_qwen.json
-  python learning/train_agent_policy.py --profile qwen3 --out data/agent_io_policy_qwen3.json
   python learning/train_agent_policy.py --dump-features
   python learning/train_agent_policy.py --dump-features --dump-profiles cursor,qwen3
   python learning/train_agent_policy.py --dump-features --dump-traces 200 --dump-samples 5
@@ -29,8 +24,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
-from dataclasses import dataclass
+import struct
+from dataclasses import asdict, dataclass
 from typing import Any, Callable, Dict, List, Tuple
 
 FEATURE_NAMES = ["mean_fanout", "std_fanout", "seq_locality", "high_layer_share"]
@@ -145,6 +142,109 @@ def _stats_to_features(s: TraceStats) -> List[float]:
     return [s.mean_fanout, s.std_fanout, s.seq_locality, s.high_layer_share]
 
 
+def load_fvecs(path: str, max_vectors: int | None = None) -> List[List[float]]:
+    """读取 TexMex fvecs：每行 uint32 dim + dim 个 float32（小端）。"""
+    out: List[List[float]] = []
+    with open(path, "rb") as fp:
+        while True:
+            hdr = fp.read(4)
+            if len(hdr) < 4:
+                break
+            (dim,) = struct.unpack("<I", hdr)
+            payload = fp.read(dim * 4)
+            if len(payload) < dim * 4:
+                break
+            vec = list(struct.unpack(f"<{dim}f", payload))
+            out.append(vec)
+            if max_vectors is not None and len(out) >= max_vectors:
+                break
+    return out
+
+
+def _l2_sq(a: List[float], b: List[float]) -> float:
+    n = min(len(a), len(b))
+    s = 0.0
+    for i in range(n):
+        d = a[i] - b[i]
+        s += d * d
+    return s
+
+
+def _learn_random_walk_trace(
+    vecs: List[List[float]],
+    steps: int,
+    rng: random.Random,
+    pool_size: int = 256,
+) -> TraceStats:
+    """
+    在 learn 向量集上模拟「每步从随机候选池中取近邻」的访问轨迹，
+    用 id 空间邻近度近似顺序读盘局部性，用距离分布近似高层/底层步。
+    """
+    n = len(vecs)
+    if n < 50:
+        raise ValueError("learn 向量过少")
+    fanouts: List[int] = []
+    seq_hits = 0
+    high_hits = 0
+    curr = rng.randrange(n)
+    pool_sz = min(pool_size, n)
+    id_span = max(500, n // 200)
+
+    for _ in range(steps):
+        q = vecs[curr]
+        pool = {curr}
+        while len(pool) < pool_sz:
+            pool.add(rng.randrange(n))
+        pool_list = list(pool)
+        scored = [(j, _l2_sq(q, vecs[j])) for j in pool_list]
+        scored.sort(key=lambda x: x[1])
+        nf = int(rng.gauss(14.0, 4.0))
+        nf = max(4, min(32, nf))
+        top = scored[:nf]
+        nbr_ids = [j for j, _ in top]
+        fanouts.append(len(nbr_ids))
+        if len(nbr_ids) >= 2:
+            span = max(nbr_ids) - min(nbr_ids)
+            if span < id_span:
+                seq_hits += 1
+        dists = [d for _, d in scored[: min(32, len(scored))]]
+        if len(dists) >= 4 and dists[0] > 1e-12:
+            med = dists[len(dists) // 2]
+            if med / dists[0] > 4.0:
+                high_hits += 1
+        curr = rng.choice(nbr_ids)
+
+    mean_f = sum(fanouts) / len(fanouts)
+    var = sum((x - mean_f) ** 2 for x in fanouts) / len(fanouts)
+    return TraceStats(
+        mean_fanout=mean_f,
+        std_fanout=math.sqrt(var),
+        seq_locality=seq_hits / steps,
+        high_layer_share=high_hits / steps,
+    )
+
+
+def _average_trace_stats(traces: List[TraceStats]) -> TraceStats:
+    if not traces:
+        raise ValueError("empty traces")
+    k = len(traces)
+    return TraceStats(
+        mean_fanout=sum(t.mean_fanout for t in traces) / k,
+        std_fanout=sum(t.std_fanout for t in traces) / k,
+        seq_locality=sum(t.seq_locality for t in traces) / k,
+        high_layer_share=sum(t.high_layer_share for t in traces) / k,
+    )
+
+
+def _cluster_from_learn_aggregate(s: TraceStats) -> int:
+    """
+    由 learn 集聚合特征选择策略簇（与 _policy_for_cluster 对齐）：
+    扇出较低、顺序局部性较高 → 偏 cluster0（cursor 类 I/O）；否则偏 cluster1。
+    """
+    score = s.mean_fanout / 32.0 - s.seq_locality * 0.55 + s.high_layer_share * 0.35
+    return 0 if score < 0.42 else 1
+
+
 _PROFILE_GENERATORS: Dict[str, Tuple[str, Callable[[int, random.Random], TraceStats]]] = {
     "cursor": ("Cursor（IDE 小步、窄扇出）", _synthetic_cursor_trace),
     "qwen-ai": ("Qwen / 长对话（宽扇出、高随机）", _synthetic_qwen_trace),
@@ -242,10 +342,49 @@ def main() -> None:
         "--profile",
         choices=("cursor", "qwen-ai", "qwen3"),
         default="cursor",
-        help="目标 Agent 画像（导出 JSON 时用；qwen3 与 qwen-ai 共用宽扇出策略簇）",
+        help="目标 Agent 画像（写入 JSON 的 agent_profile；learn 模式下仍用于命名）",
     )
     ap.add_argument("--out", default="data/agent_io_policy.json")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--data-source",
+        choices=("auto", "synthetic", "learn-fvecs"),
+        default="auto",
+        help="auto：若存在 --learn-fvecs 则读 learn 集，否则合成轨迹",
+    )
+    ap.add_argument(
+        "--learn-fvecs",
+        default="data/sift/sift_learn.fvecs",
+        help="SIFT learn 集路径（fvecs）",
+    )
+    ap.add_argument(
+        "--learn-max-vectors",
+        type=int,
+        default=80000,
+        metavar="N",
+        help="最多载入的 learn 向量条数（控内存/时间）",
+    )
+    ap.add_argument(
+        "--learn-traces",
+        type=int,
+        default=120,
+        metavar="T",
+        help="learn 模式下随机游走的轨迹条数",
+    )
+    ap.add_argument(
+        "--trace-steps",
+        type=int,
+        default=200,
+        metavar="S",
+        help="每条轨迹的步数",
+    )
+    ap.add_argument(
+        "--learn-pool-size",
+        type=int,
+        default=256,
+        metavar="P",
+        help="learn 模式下每步随机候选池大小",
+    )
     ap.add_argument(
         "--dump-features",
         action="store_true",
@@ -279,35 +418,71 @@ def main() -> None:
         return
 
     rng = random.Random(args.seed)
+    data_source = args.data_source
+    if data_source == "auto":
+        data_source = "learn-fvecs" if os.path.isfile(args.learn_fvecs) else "synthetic"
 
-    traces: List[TraceStats] = []
-    labels: List[int] = []
-    for _ in range(40):
-        traces.append(_synthetic_cursor_trace(200, rng))
-        labels.append(0)
-    for _ in range(40):
-        traces.append(_synthetic_qwen_trace(200, rng))
-        labels.append(1)
-    for _ in range(40):
-        traces.append(_synthetic_qwen3_trace(200, rng))
-        labels.append(2)
-
-    X = [_stats_to_features(t) for t in traces]
-    tree_info = _maybe_print_tree(X, labels)
-
-    cluster = 0 if args.profile == "cursor" else 1
-    policy = _policy_for_cluster(cluster, args.profile)
-    policy["_meta"] = {
+    meta: Dict[str, Any] = {
         "trainer": "train_agent_policy.py",
-        "tree_probe": tree_info,
+        "data_source": data_source,
         "papers_mapping": "GoVector/SARC/PAIC/Baleen/一次性访问排除 → 分层预取+顺序化+二次准入",
     }
+
+    if data_source == "learn-fvecs":
+        if not os.path.isfile(args.learn_fvecs):
+            raise SystemExit(f"--data-source=learn-fvecs 但未找到文件: {args.learn_fvecs}")
+        vecs = load_fvecs(args.learn_fvecs, args.learn_max_vectors)
+        if len(vecs) < 100:
+            raise SystemExit(f"learn 向量过少: {len(vecs)}，请检查 {args.learn_fvecs}")
+        d0 = len(vecs[0])
+        if any(len(v) != d0 for v in vecs[: min(2000, len(vecs))]):
+            raise SystemExit("learn fvecs 行维度不一致")
+        traces = [
+            _learn_random_walk_trace(vecs, args.trace_steps, rng, args.learn_pool_size)
+            for _ in range(args.learn_traces)
+        ]
+        s_agg = _average_trace_stats(traces)
+        cluster = _cluster_from_learn_aggregate(s_agg)
+        med = sorted(t.mean_fanout for t in traces)[len(traces) // 2]
+        labels = [0 if t.mean_fanout < med else 1 for t in traces]
+        X = [_stats_to_features(t) for t in traces]
+        tree_info = _maybe_print_tree(X, labels)
+        policy = _policy_for_cluster(cluster, args.profile)
+        meta["tree_probe"] = tree_info
+        meta["learn_fvecs"] = args.learn_fvecs
+        meta["learn_vectors_loaded"] = len(vecs)
+        meta["learn_traces"] = args.learn_traces
+        meta["trace_steps"] = args.trace_steps
+        meta["learn_pool_size"] = args.learn_pool_size
+        meta["aggregate_trace_stats"] = {k: round(v, 6) for k, v in asdict(s_agg).items()}
+        meta["policy_cluster"] = cluster
+    else:
+        traces: List[TraceStats] = []
+        labels: List[int] = []
+        for _ in range(40):
+            traces.append(_synthetic_cursor_trace(200, rng))
+            labels.append(0)
+        for _ in range(40):
+            traces.append(_synthetic_qwen_trace(200, rng))
+            labels.append(1)
+        for _ in range(40):
+            traces.append(_synthetic_qwen3_trace(200, rng))
+            labels.append(2)
+
+        X = [_stats_to_features(t) for t in traces]
+        tree_info = _maybe_print_tree(X, labels)
+        cluster = 0 if args.profile == "cursor" else 1
+        policy = _policy_for_cluster(cluster, args.profile)
+        meta["tree_probe"] = tree_info
+        meta["policy_cluster"] = cluster
+
+    policy["_meta"] = meta
 
     with open(args.out, "w", encoding="utf-8") as fp:
         json.dump(policy, fp, indent=2, ensure_ascii=False)
         fp.write("\n")
     print(f"written: {args.out}")
-    print(tree_info)
+    print(meta.get("tree_probe", ""))
 
 
 if __name__ == "__main__":
