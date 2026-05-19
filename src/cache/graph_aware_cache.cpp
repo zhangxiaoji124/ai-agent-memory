@@ -9,10 +9,23 @@
 
 namespace amio::cache {
 
-GraphAwareCache::GraphAwareCache(size_t capacity_bytes,
+GraphAwareCache::GraphAwareCache(size_t dynamic_capacity_bytes, size_t pinned_capacity_bytes,
                                  const policy::AgentIoPolicy *policy,
                                  ::amio::IoMetrics *io_metrics)
-    : capacity_bytes_(capacity_bytes), policy_(policy), io_metrics_(io_metrics) {}
+    : dynamic_capacity_bytes_(dynamic_capacity_bytes),
+      pinned_capacity_bytes_(pinned_capacity_bytes),
+      policy_(policy),
+      io_metrics_(io_metrics) {}
+
+bool GraphAwareCache::is_pinned(uint64_t node_id) const {
+  std::shared_lock lk(mu_);
+  return pinned_.find(node_id) != pinned_.end();
+}
+
+uint64_t GraphAwareCache::pinned_bytes_used() const {
+  std::shared_lock lk(mu_);
+  return pinned_used_bytes_;
+}
 
 bool GraphAwareCache::contains(uint64_t node_id) const {
   std::shared_lock lk(mu_);
@@ -106,10 +119,14 @@ bool GraphAwareCache::get_or_load(amio::index::IndexFile *file,
 void GraphAwareCache::pin(uint64_t node_id, const amio::index::NodeBlock &b) {
   std::unique_lock lk(mu_);
   if (pinned_.find(node_id) == pinned_.end()) {
-    used_bytes_ += amio::index::kBlockSize;
+    if (pinned_capacity_bytes_ > 0 &&
+        pinned_used_bytes_ + amio::index::kBlockSize > pinned_capacity_bytes_) {
+      return;
+    }
+    pinned_used_bytes_ += amio::index::kBlockSize;
+    static_pins_count_++;
   }
   pinned_[node_id] = b;
-  evict_if_needed_locked();
 }
 
 void GraphAwareCache::insert_hot(uint64_t node_id, const amio::index::NodeBlock &b) {
@@ -123,16 +140,16 @@ void GraphAwareCache::insert_hot_locked(uint64_t node_id,
   e.block = b;
   e.tick = ++tick_;
   if (hot_.find(node_id) == hot_.end()) {
-    used_bytes_ += amio::index::kBlockSize;
+    hot_used_bytes_ += amio::index::kBlockSize;
   }
   hot_[node_id] = e;
   evict_if_needed_locked();
 }
 
 void GraphAwareCache::evict_if_needed_locked() {
-  if (capacity_bytes_ == 0)
+  if (dynamic_capacity_bytes_ == 0)
     return;
-  while (used_bytes_ > capacity_bytes_ && !hot_.empty()) {
+  while (hot_used_bytes_ > dynamic_capacity_bytes_ && !hot_.empty()) {
     uint64_t victim = 0;
     uint64_t best = std::numeric_limits<uint64_t>::max();
     for (const auto &kv : hot_) {
@@ -142,7 +159,7 @@ void GraphAwareCache::evict_if_needed_locked() {
       }
     }
     hot_.erase(victim);
-    used_bytes_ -= amio::index::kBlockSize;
+    hot_used_bytes_ -= amio::index::kBlockSize;
   }
 }
 

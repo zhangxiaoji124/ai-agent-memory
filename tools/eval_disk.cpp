@@ -11,8 +11,13 @@
 #include <vector>
 
 #include "dataset/fvecs.h"
+#include "dataset/index_build_common.h"
+#include "dataset/index_builder.h"
+#include "dataset/vector_dataset.h"
+#include "index/external_vectors.h"
 #include "index/hnsw.h"
 #include "index/storage_layout.h"
+#include "runtime/memory_partition.h"
 #include "util/time.h"
 #include "vector_store.h"
 
@@ -88,6 +93,8 @@ static bool build_index_file(const std::vector<std::vector<float>> &vecs,
   }
 
   amio::index::IndexFileHeader h{};
+  h.version = dim > amio::index::kMaxInlineVectorDim ? amio::index::kIndexVersion2
+                                                     : amio::index::kIndexVersion1;
   h.total_nodes = static_cast<uint64_t>(vecs.size());
   h.dim = dim;
   h.entry_point = idx.entry_point();
@@ -98,27 +105,21 @@ static bool build_index_file(const std::vector<std::vector<float>> &vecs,
     return false;
   }
 
-  for (uint64_t id = 0; id < static_cast<uint64_t>(vecs.size()); id++) {
-    amio::index::NodeBlock b{};
-    b.node_id = id;
-    b.layer = static_cast<uint8_t>(std::min(255, std::max(0, idx.node_max_layer(id))));
-    b.vec_dim = dim > 65535u ? 65535u : static_cast<uint16_t>(dim);
-    for (uint32_t i = 0; i < dim && i < 128; i++) {
-      b.vector[i] = vecs[static_cast<size_t>(id)][i];
-    }
-    for (int l = 0; l < 8; l++) {
-      const auto &nbl = idx.neighbors_at(l, id);
-      const size_t cnt = std::min<size_t>(32, nbl.size());
-      b.neighbor_counts[static_cast<size_t>(l)] = static_cast<uint8_t>(cnt);
-      for (size_t j = 0; j < cnt; j++) {
-        const uint64_t nid = nbl[j];
-        b.neighbors[static_cast<size_t>(l)][j] = static_cast<uint32_t>(nid);
-        b.neighbor_offsets[static_cast<size_t>(l)][j] = amio::index::node_offset(nid);
-      }
-    }
-    if (!f.pwrite_node(id, b)) {
-      return false;
-    }
+  if (!amio::dataset::write_graph_nodes(f, idx, dim, h.total_nodes)) {
+    return false;
+  }
+
+  const size_t n = vecs.size();
+  if (!amio::dataset::finalize_index_vectors(
+          f, &h, dim, amio::index::VectorEncoding::Float32,
+          [&vecs, n](uint64_t id, std::vector<float> *out) {
+            if (id >= n) {
+              return false;
+            }
+            *out = vecs[static_cast<size_t>(id)];
+            return true;
+          })) {
+    return false;
   }
 
   f.close();
@@ -211,13 +212,51 @@ int main(int argc, char **argv) {
                                       ? std::string()
                                       : metrics_log_arg;
 
+  const size_t ram_budget_gb = arg_size_t(argc, argv, "--ram-budget-gb", 0);
+  uint64_t ram_budget_bytes = ram_budget_gb > 0 ? ram_budget_gb * 1024ull * 1024 * 1024 : 0;
+  ram_budget_bytes = amio::runtime::resolve_ram_budget_bytes(ram_budget_bytes);
+
+  const std::string profile_override_str =
+      arg_string(argc, argv, "--memory-profile", "");
+  amio::runtime::MemoryPartitionProfile profile_override =
+      amio::runtime::MemoryPartitionProfile::Unspecified;
+  if (!profile_override_str.empty()) {
+    profile_override = amio::runtime::parse_profile_name(profile_override_str.c_str());
+  }
+
+  const auto partition = amio::runtime::select_memory_partition(
+      {base_path}, ram_budget_bytes, profile_override);
+  std::fprintf(stderr,
+               "memory_partition: profile=%s kind=%s data_gb=%.2f ram_gb=%.2f rho=%.2f "
+               "pools_mt=%llu static=%llu dynamic=%llu kernel=%s\n",
+               amio::runtime::profile_name(partition.profile),
+               amio::runtime::vector_kind_name(partition.dataset.kind),
+               partition.dataset.data_bytes / (1024.0 * 1024 * 1024),
+               ram_budget_bytes / (1024.0 * 1024 * 1024), partition.dataset.rho,
+               static_cast<unsigned long long>(partition.pools.memtable_bytes / (1024 * 1024)),
+               static_cast<unsigned long long>(partition.pools.static_cache_bytes / (1024 * 1024)),
+               static_cast<unsigned long long>(partition.pools.dynamic_cache_bytes / (1024 * 1024)),
+               partition.distance_kernel);
+
+  const bool base_is_bvec =
+      partition.dataset.kind == amio::runtime::VectorFileKind::Bvecs;
+  const size_t load_cap = base_limit > 0 ? base_limit : static_cast<size_t>(100000);
+
   std::vector<std::vector<float>> base_all;
   std::vector<std::vector<float>> queries_all;
   std::vector<std::vector<uint32_t>> gt_all;
-  if (!amio::dataset::load_fvecs(base_path, &base_all) || base_all.empty()) {
+
+  if (base_is_bvec) {
+    if (!amio::dataset::VectorDataset::load_subset_float(base_path, load_cap, &base_all) ||
+        base_all.empty()) {
+      std::fprintf(stderr, "读取 bvec base 子集失败: %s\n", base_path.c_str());
+      return 2;
+    }
+  } else if (!amio::dataset::load_fvecs(base_path, &base_all) || base_all.empty()) {
     std::fprintf(stderr, "读取 base 失败: %s\n", base_path.c_str());
     return 2;
   }
+
   if (!amio::dataset::load_fvecs(query_path, &queries_all) || queries_all.empty()) {
     std::fprintf(stderr, "读取 query 失败: %s\n", query_path.c_str());
     return 3;
@@ -235,7 +274,16 @@ int main(int argc, char **argv) {
     std::fprintf(stderr,
                  "rebuild index: base=%zu dim=%zu m=%u ef_construction=%u -> %s\n",
                  nbase, base[0].size(), m, ef_construction, index_path.c_str());
-    if (!build_index_file(base, index_path, m, ef_construction)) {
+    bool built = false;
+    if (base_is_bvec && partition.dataset.data_bytes >
+                            static_cast<uint64_t>(512) * 1024 * 1024) {
+      built = amio::dataset::build_disk_index_streaming(
+          base_path, index_path, m, ef_construction, nbase,
+          partition.stream_index_batch_vectors);
+    } else {
+      built = build_index_file(base, index_path, m, ef_construction);
+    }
+    if (!built) {
       std::fprintf(stderr, "构建索引失败: %s\n", index_path.c_str());
       return 5;
     }
@@ -289,18 +337,21 @@ int main(int argc, char **argv) {
   cfg.index_path = index_path;
   cfg.enable_wal = false;
   cfg.ef_search = ef_search;
-  cfg.memtable_limit_mb = 1;
-  cfg.cache_size_mb = 512;
-  cfg.prefetch_depth = 1;
+  cfg.prefetch_depth = partition.prefetch_depth_hint > 0 ? partition.prefetch_depth_hint : 1;
   cfg.enable_compaction = true;
   cfg.enable_memtable_search = true;
   cfg.force_disable_uring = force_disable_uring;
   cfg.agent_policy_mode = policy_mode;
   cfg.agent_policy_path = policy_path_resolved;
+  cfg.ram_budget_bytes = ram_budget_bytes;
+  amio::runtime::apply_partition_to_config(partition, &cfg);
+  cfg.ef_search = ef_search;
 
   if (mode == "baseline1") {
     // 关闭预取/缓存：贴合文档中的 Baseline-1 定义。
     cfg.cache_size_mb = 0;
+    cfg.static_cache_mb = 0;
+    cfg.enable_static_subgraph_pin = false;
     cfg.prefetch_depth = 0;
   } else if (mode == "baseline2") {
     // 仅保留磁盘 HNSW 主路径，不启用写优化相关逻辑。
@@ -308,6 +359,8 @@ int main(int argc, char **argv) {
     cfg.enable_compaction = false;
     cfg.enable_memtable_search = false;
     cfg.cache_size_mb = 0;
+    cfg.static_cache_mb = 0;
+    cfg.enable_static_subgraph_pin = false;
     cfg.prefetch_depth = 0;
   }
 
@@ -435,6 +488,17 @@ int main(int argc, char **argv) {
       << (epol.sort_prefetch_by_disk_offset ? 1 : 0) << "\n";
   ofs << "effective_hot_insert_min_prior_misses=" << epol.hot_insert_min_prior_misses
       << "\n";
+  const auto &part = store.partition();
+  ofs << "memory_profile=" << amio::runtime::profile_name(part.profile) << "\n";
+  ofs << "vector_file_kind=" << amio::runtime::vector_kind_name(part.dataset.kind) << "\n";
+  ofs << "rho=" << part.dataset.rho << "\n";
+  ofs << "pool_memtable_mb=" << (part.pools.memtable_bytes / (1024 * 1024)) << "\n";
+  ofs << "pool_static_mb=" << (part.pools.static_cache_bytes / (1024 * 1024)) << "\n";
+  ofs << "pool_dynamic_mb=" << (part.pools.dynamic_cache_bytes / (1024 * 1024)) << "\n";
+  ofs << "static_pins=" << store.static_pins_count() << "\n";
+  ofs << "distance_kernel=" << part.distance_kernel << "\n";
+  ofs << "index_dim=" << store.partition().dataset.dim << "\n";
+  ofs << "uses_external_vectors=" << (store.uses_external_vectors() ? 1 : 0) << "\n";
   ofs << "io_uring_active=" << (store.io_uring_active() ? 1 : 0) << "\n";
   ofs << "k=" << k << "\n";
   ofs << "ef_search=" << ef_search << "\n";

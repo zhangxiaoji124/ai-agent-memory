@@ -142,6 +142,41 @@ def _stats_to_features(s: TraceStats) -> List[float]:
     return [s.mean_fanout, s.std_fanout, s.seq_locality, s.high_layer_share]
 
 
+def load_bvecs(path: str, max_vectors: int | None = None) -> List[List[float]]:
+    """读取 bvecs（uint8）并提升为 float，用于 learn 游走（子集）。"""
+    out: List[List[float]] = []
+    with open(path, "rb") as fp:
+        while True:
+            hdr = fp.read(4)
+            if len(hdr) < 4:
+                break
+            (dim,) = struct.unpack("<I", hdr)
+            payload = fp.read(dim)
+            if len(payload) < dim:
+                break
+            out.append([float(b) for b in payload])
+            if max_vectors is not None and len(out) >= max_vectors:
+                break
+    return out
+
+
+def _memory_profile_meta(path: str, ram_budget_gb: float = 100.0) -> Dict[str, Any]:
+    sz = os.path.getsize(path) if os.path.isfile(path) else 0
+    rho = sz / (ram_budget_gb * (1024**3)) if ram_budget_gb > 0 else 0.0
+    if path.endswith(".bvecs") and sz >= 400 * (1024**3) and 80 <= ram_budget_gb <= 128:
+        prof = "BVEC_ULTRA_500G_100G"
+    elif path.endswith(".bvecs") and (sz >= 100 * (1024**3) or rho >= 3):
+        prof = "BVEC_DISK_TIERED"
+    else:
+        prof = "DISK_FIRST"
+    return {
+        "memory_profile": prof,
+        "data_bytes_gb": round(sz / (1024**3), 3),
+        "ram_budget_gb": ram_budget_gb,
+        "compression_ratio_rho": round(rho, 3),
+    }
+
+
 def load_fvecs(path: str, max_vectors: int | None = None) -> List[List[float]]:
     """读取 TexMex fvecs：每行 uint32 dim + dim 个 float32（小端）。"""
     out: List[List[float]] = []
@@ -348,7 +383,7 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument(
         "--data-source",
-        choices=("auto", "synthetic", "learn-fvecs"),
+        choices=("auto", "synthetic", "learn-fvecs", "learn-bvecs"),
         default="auto",
         help="auto：若存在 --learn-fvecs 则读 learn 集，否则合成轨迹",
     )
@@ -420,7 +455,12 @@ def main() -> None:
     rng = random.Random(args.seed)
     data_source = args.data_source
     if data_source == "auto":
-        data_source = "learn-fvecs" if os.path.isfile(args.learn_fvecs) else "synthetic"
+        if os.path.isfile(args.learn_fvecs):
+            data_source = (
+                "learn-bvecs" if args.learn_fvecs.endswith(".bvecs") else "learn-fvecs"
+            )
+        else:
+            data_source = "synthetic"
 
     meta: Dict[str, Any] = {
         "trainer": "train_agent_policy.py",
@@ -428,10 +468,13 @@ def main() -> None:
         "papers_mapping": "GoVector/SARC/PAIC/Baleen/一次性访问排除 → 分层预取+顺序化+二次准入",
     }
 
-    if data_source == "learn-fvecs":
+    if data_source in ("learn-fvecs", "learn-bvecs"):
         if not os.path.isfile(args.learn_fvecs):
-            raise SystemExit(f"--data-source=learn-fvecs 但未找到文件: {args.learn_fvecs}")
-        vecs = load_fvecs(args.learn_fvecs, args.learn_max_vectors)
+            raise SystemExit(f"--data-source={data_source} 但未找到文件: {args.learn_fvecs}")
+        if data_source == "learn-bvecs":
+            vecs = load_bvecs(args.learn_fvecs, args.learn_max_vectors)
+        else:
+            vecs = load_fvecs(args.learn_fvecs, args.learn_max_vectors)
         if len(vecs) < 100:
             raise SystemExit(f"learn 向量过少: {len(vecs)}，请检查 {args.learn_fvecs}")
         d0 = len(vecs[0])
@@ -448,6 +491,7 @@ def main() -> None:
         X = [_stats_to_features(t) for t in traces]
         tree_info = _maybe_print_tree(X, labels)
         policy = _policy_for_cluster(cluster, args.profile)
+        policy.update(_memory_profile_meta(args.learn_fvecs))
         meta["tree_probe"] = tree_info
         meta["learn_fvecs"] = args.learn_fvecs
         meta["learn_vectors_loaded"] = len(vecs)

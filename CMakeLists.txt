@@ -21,6 +21,12 @@ add_library(amio
   src/write/wal.cpp
   src/write/compaction.cpp
   src/dataset/fvecs.cpp
+  src/dataset/vector_dataset.cpp
+  src/dataset/index_builder.cpp
+  src/dataset/index_build_common.cpp
+  src/index/external_vectors.cpp
+  src/runtime/memory_partition.cpp
+  src/runtime/static_subgraph.cpp
   src/vector_store.cpp
         include/cache/graph_aware_cache.h
         include/util/io_metrics.h
@@ -53,6 +59,8 @@ add_executable(run_tests
   tests/recall_test.cpp
   tests/disk_roundtrip_test.cpp
   tests/concurrent_test.cpp
+  tests/memory_partition_test.cpp
+  tests/high_dim_index_test.cpp
 )
 target_link_libraries(run_tests PRIVATE amio)
 

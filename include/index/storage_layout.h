@@ -8,6 +8,9 @@ namespace amio::index {
 
 constexpr size_t kBlockSize = 4096;
 constexpr uint64_t kMagic = 0x5844494D45474D41ULL; // "AGMEMIDX" (little-endian-ish)
+constexpr uint32_t kIndexVersion1 = 1;           // 向量内联 NodeBlock（dim≤128）
+constexpr uint32_t kIndexVersion2 = 2;           // 向量外置连续区（任意 dim，如 960）
+constexpr uint32_t kMaxInlineVectorDim = 128;
 
 #pragma pack(push, 1)
 struct alignas(4096) IndexFileHeader {
@@ -21,7 +24,14 @@ struct alignas(4096) IndexFileHeader {
   uint32_t dim = 128;
   uint64_t entry_point = 0;
   uint64_t high_layer_end_offset = kBlockSize;
-  uint8_t _reserved[4040]{};
+  /// v2：向量区在文件中的起始偏移；0 表示 v1 内联于 NodeBlock。
+  uint64_t vector_section_offset = 0;
+  /// 每条向量字节数（float32: dim*4；uint8: dim）。
+  uint32_t vector_stride_bytes = 0;
+  /// 0=float32, 1=uint8（见 VectorEncoding）。
+  uint8_t vector_encoding = 0;
+  uint8_t _pad_hdr[3]{};
+  uint8_t _reserved[4024]{};
 };
 static_assert(sizeof(IndexFileHeader) == kBlockSize);
 

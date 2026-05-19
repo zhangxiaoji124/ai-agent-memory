@@ -1,6 +1,6 @@
 # ai-agent-memory（agent-memory-io-cpp）
 
-面向 Agent 记忆的向量检索系统 I/O 优化（C++）。支持磁盘 HNSW 检索、io_uring 预取、图感知缓存，以及 **内置策略 / 离线学习策略** 对照评测。
+面向 Agent 记忆的向量检索系统 I/O 优化（C++）。支持磁盘 HNSW 检索、io_uring 预取、图感知缓存（Static/Dynamic 分池）、**内存划分模式自动区分**（fvecs/bvecs、体量/维度）、**高维向量**（dim>128 如 GIST 960），以及 **builtin / learned** 策略对照评测。
 
 > 仓库地址：[zhangxiaoji124/ai-agent-memory](https://github.com/zhangxiaoji124/ai-agent-memory)
 
@@ -45,11 +45,13 @@ chmod +x scripts/linux_run.sh
 
 | 步骤 | 命令 | 说明 |
 |------|------|------|
-| 安装依赖 | `./scripts/linux_run.sh deps` | 按发行版安装 cmake、g++、liburing-dev、wget（需 sudo） |
+| 安装依赖 | `./scripts/linux_run.sh deps` | 按发行版安装 cmake、g++、liburing-dev、wget、python3（需 sudo） |
 | 下载数据 | `./scripts/linux_run.sh fetch-sift` | SIFT 解压到 `data/sift/` |
-| 学习策略 | `./scripts/linux_run.sh policy` | 生成 `data/agent_io_policy.json`（需 python3） |
+| 探测数据集 | `./scripts/linux_run.sh probe-dataset data/sift/sift_base.fvecs` | 类型/维度/体量 + 内存划分模式 M0–M4 |
+| 学习策略 | `./scripts/linux_run.sh policy` | 生成 `data/agent_io_policy.json`（fvecs/bvecs learn） |
 | 编译 | `./scripts/linux_run.sh build` | 产物在 `build/` |
-| 单测 | `./scripts/linux_run.sh test` | `./build/run_tests` |
+| 建索引 | `./scripts/linux_run.sh build-index` | 默认 SIFT fvecs；支持 bvec、dim>128 流式 |
+| 单测 | `./scripts/linux_run.sh test` | 含 memory_partition、960 维索引测试 |
 | 基准 | `./scripts/linux_run.sh bench` | `bench_search` + `bench_write` |
 
 ### 3. 两种 I/O 策略对比（builtin vs learned）
@@ -97,7 +99,29 @@ chmod +x scripts/linux_run.sh
 
 关闭逐查询 CSV：`--metrics-log none`
 
-### 5. 常用环境变量
+### 5. 向量格式、维度与内存划分
+
+| 格式 | 说明 |
+|------|------|
+| `.fvecs` | float32 向量（SIFT 子集、GIST 960 等） |
+| `.bvecs` | uint8 向量（SIFT1B 等大规模库） |
+| `.ivecs` | groundtruth，仅评测用 |
+
+- **dim ≤ 128**：索引 **v1**，向量内联在 4KB `NodeBlock` 中。  
+- **dim > 128**（如 **960 维**）：索引 **v2**，图结构仍在 4KB 块，向量在索引文件**尾部外置区**（mmap 读取）。  
+- **内存划分区分器** 根据文件类型与 `data_bytes / ram_budget` 选择模式（`HOST_RESIDENT` … `BVEC_ULTRA_500G_100G`），并切分 MemTable 10% / Static 20% / Dynamic 70%。
+
+```bash
+# 100GB 内存预算下评测（大 bvec 场景）
+export AMIO_RAM_BUDGET_GB=100
+export AMIO_MEMORY_PROFILE=BVEC_ULTRA_500G_100G   # 可选，强制模式
+./scripts/linux_run.sh eval-quick
+
+./build/build_index --input /path/base.bvecs --output data/big.index \
+  --ram-budget-gb 100 --max-vectors 10000000
+```
+
+### 6. 常用环境变量
 
 ```bash
 export CC=gcc CXX=g++              # 或 clang/clang++
@@ -106,9 +130,11 @@ export JOBS=$(nproc)
 export AMIO_ENABLE_URING=ON        # 无 liburing 时设为 OFF
 export CMP_BASE_LIMIT=100000       # compare 时 base 向量数上限
 export CMP_QUERY_LIMIT=200         # compare 时 query 数上限
+export AMIO_RAM_BUDGET_GB=100      # 内存划分预算（与 --ram-budget-gb 等价）
+export AMIO_MEMORY_PROFILE=DISK_FIRST
 ```
 
-### 6. 不用脚本时的等价命令
+### 7. 不用脚本时的等价命令
 
 ```bash
 # Debian/Ubuntu 依赖
@@ -119,16 +145,19 @@ cmake -B build -DAMIO_ENABLE_URING=ON
 cmake --build build -j$(nproc)
 ./build/run_tests
 
-# 生成索引（需先有 data/sift/sift_base.fvecs）
-./build/build_index --input data/sift/sift_base.fvecs --output data/sift_base.index
+# 生成索引（fvecs；dim>128 或 bvec 自动流式 + v2 外置向量）
+./build/build_index --input data/sift/sift_base.fvecs --output data/sift_base.index \
+  --ram-budget-gb 100
 
-# 磁盘评测
+# 磁盘评测（自动内存划分 + 静态子图 pin）
 ./build/eval_disk --base data/sift/sift_base.fvecs \
   --query data/sift/sift_query.fvecs \
-  --index data/sift_base.index
+  --index data/sift_base.index \
+  --ram-budget-gb 100 \
+  --policy-mode learned --agent-policy data/agent_io_policy.json
 ```
 
-### 7. Docker（可选）
+### 8. Docker（可选）
 
 ```bash
 docker build -t ai-agent-memory .
@@ -137,15 +166,16 @@ docker run --rm ai-agent-memory
 
 容器内会下载 SIFT、编译并运行 `run_tests`。
 
-### 8. 离线学习策略（Python）
+### 9. 离线学习策略（Python）
 
 ```bash
-python3 learning/train_agent_policy.py --profile cursor --out data/agent_io_policy.json
-python3 learning/train_agent_policy.py --profile qwen-ai --out data/agent_io_policy_qwen.json
+python3 learning/train_agent_policy.py --data-source auto --out data/agent_io_policy.json
+python3 learning/train_agent_policy.py --data-source learn-bvecs \
+  --learn-fvecs data/sift/sift_learn.bvecs --out data/agent_io_policy.json
 python3 learning/train_agent_policy.py --dump-features
 ```
 
-示例 JSON 见 `learning/policies/*.example.json`。
+示例 JSON 见 `learning/policies/*.example.json`。设计说明见 `Agent 长时记忆存储引擎设计(1).md`、`docs/Agent长时记忆-实现状态对照.md`。
 
 ---
 

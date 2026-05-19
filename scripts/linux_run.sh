@@ -42,20 +42,29 @@ Linux 运行脚本（agent-memory-io-cpp）
   CMP_INDEX            compare 子命令共用的索引路径 (默认: data/sift_compare.index)
   CMP_BASE_LIMIT       compare / eval 的 base 条数上限 (默认: 100000)
   CMP_QUERY_LIMIT      compare / eval 的 query 条数上限 (默认: 200)
+  AMIO_RAM_BUDGET_GB   内存划分区分器预算 GB（默认: 物理内存 80% 或见 eval/build 的 --ram-budget-gb）
+  AMIO_MEMORY_PROFILE  强制划分模式: HOST_RESIDENT|HYBRID_FLOAT|DISK_FIRST|BVEC_DISK_TIERED|BVEC_ULTRA_500G_100G
 
 子命令:
   help              显示本说明
   deps              自动识别发行版并安装 cmake、C++ 编译器、liburing 开发包、wget（需 sudo）
   fetch-sift        下载并解压 SIFT 到 data/sift/
-  policy            生成 data/agent_io_policy.json（优先用 data/sift/sift_learn.fvecs，否则合成轨迹）
+  policy            生成 data/agent_io_policy.json（优先 learn-fvecs；.bvecs 自动 learn-bvecs）
   build             cmake 配置并编译（使用当前 CC/CXX）
-  test              运行 run_tests
+  test              运行 run_tests（含 memory_partition、960 维索引冒烟）
   bench             运行 bench_search 与 bench_write
-  eval              运行 eval_disk，参数原样透传
-  eval-quick        小规模 eval_disk（有策略文件时自动 --policy-mode learned）
+  probe-dataset     探测向量文件类型/维度/体量并打印内存划分模式（dataset_loader）
+  build-index       流式/内存建索引（支持 fvecs/bvecs，dim>128 自动 v2 外置向量区）
+  eval              运行 eval_disk，参数原样透传（支持 --ram-budget-gb、--memory-profile）
+  eval-quick        小规模 eval_disk（自动内存划分 + learned 策略）
   compare           同一索引上先后跑 builtin 与 learned，生成 logs/compare_* 汇总与逐查询 CSV
   smoke             build + test + bench
   all               deps + fetch-sift + policy + build + test + bench + eval-quick
+
+向量与维度:
+  - .fvecs / .bvecs / .ivecs（TexMex）；.bvecs 为 uint8（如 SIFT1B）
+  - dim<=128: 索引 v1（向量内联 NodeBlock）；dim>128（如 GIST 960）: 索引 v2（外置向量区）
+  - 大文件请用 build-index 或 eval --ram-budget-gb，勿整表载入内存
 
 逐查询指标:
   eval_disk 默认将每条查询的延迟、recall、磁盘块读、预取提交量、缓存命中等写入
@@ -64,7 +73,11 @@ Linux 运行脚本（agent-memory-io-cpp）
 示例:
   CC=clang CXX=clang++ ./scripts/linux_run.sh build
   ./scripts/linux_run.sh fetch-sift && ./scripts/linux_run.sh compare
-  ./scripts/linux_run.sh eval -- --policy-mode builtin --metrics-log logs/builtin.csv
+  ./scripts/linux_run.sh probe-dataset data/sift/sift_base.fvecs
+  ./scripts/linux_run.sh build-index -- --input data/sift/sift_base.fvecs --output data/sift.index
+  AMIO_RAM_BUDGET_GB=100 ./scripts/linux_run.sh eval-quick
+  ./scripts/linux_run.sh eval -- --ram-budget-gb 100 --memory-profile BVEC_ULTRA_500G_100G \
+    --policy-mode learned --agent-policy data/agent_io_policy.json
 EOF
 }
 
@@ -148,11 +161,40 @@ run_policy() {
     echo "使用 learn 集: data/sift/sift_learn.fvecs 训练策略 JSON"
     "$py" learning/train_agent_policy.py --profile cursor --out data/agent_io_policy.json \
       --data-source learn-fvecs --learn-fvecs data/sift/sift_learn.fvecs
+  elif [[ -f data/sift/sift_learn.bvecs ]]; then
+    echo "使用 learn bvec: data/sift/sift_learn.bvecs"
+    "$py" learning/train_agent_policy.py --profile cursor --out data/agent_io_policy.json \
+      --data-source learn-bvecs --learn-fvecs data/sift/sift_learn.bvecs
   else
-    echo "未找到 data/sift/sift_learn.fvecs，使用合成轨迹生成策略（可先执行 fetch-sift）"
+    echo "未找到 learn 集，使用合成轨迹生成策略（可先执行 fetch-sift）"
     "$py" learning/train_agent_policy.py --profile cursor --out data/agent_io_policy.json \
       --data-source synthetic
   fi
+}
+
+run_probe_dataset() {
+  [[ -x "$BUILD_DIR/dataset_loader" ]] || die "请先构建: ./scripts/linux_run.sh build"
+  if [[ $# -lt 1 ]]; then
+    die "用法: ./scripts/linux_run.sh probe-dataset <path.fvecs|bvecs|ivecs>"
+  fi
+  "./$BUILD_DIR/dataset_loader" "$1"
+}
+
+run_build_index() {
+  [[ -x "$BUILD_DIR/build_index" ]] || die "请先构建"
+  mkdir -p data logs
+  local ram_gb="${AMIO_RAM_BUDGET_GB:-}"
+  local extra=()
+  if [[ -n "$ram_gb" ]]; then
+    extra+=(--ram-budget-gb "$ram_gb")
+  fi
+  if [[ $# -eq 0 ]]; then
+    [[ -f data/sift/sift_base.fvecs ]] || die "请指定参数或先 fetch-sift"
+    "./$BUILD_DIR/build_index" --input data/sift/sift_base.fvecs \
+      --output data/sift_base.index "${extra[@]}"
+    return 0
+  fi
+  "./$BUILD_DIR/build_index" "$@" "${extra[@]}"
 }
 
 run_build() {
@@ -188,7 +230,15 @@ run_eval_quick() {
   if [[ -f data/agent_io_policy.json ]]; then
     pm_args=(--policy-mode learned --agent-policy data/agent_io_policy.json)
   fi
-  "./$BUILD_DIR/eval_disk" "${pm_args[@]}" \
+  local ram_args=()
+  if [[ -n "${AMIO_RAM_BUDGET_GB:-}" ]]; then
+    ram_args+=(--ram-budget-gb "$AMIO_RAM_BUDGET_GB")
+  fi
+  local prof_args=()
+  if [[ -n "${AMIO_MEMORY_PROFILE:-}" ]]; then
+    prof_args+=(--memory-profile "$AMIO_MEMORY_PROFILE")
+  fi
+  "./$BUILD_DIR/eval_disk" "${pm_args[@]}" "${ram_args[@]}" "${prof_args[@]}" \
     --base-limit 5000 \
     --query-limit 20 \
     --k 10 \
@@ -207,6 +257,10 @@ run_compare() {
   local idx="${CMP_INDEX:-data/sift_compare.index}"
   local bl="${CMP_BASE_LIMIT:-100000}"
   local ql="${CMP_QUERY_LIMIT:-200}"
+  local ram_args=()
+  if [[ -n "${AMIO_RAM_BUDGET_GB:-}" ]]; then
+    ram_args+=(--ram-budget-gb "$AMIO_RAM_BUDGET_GB")
+  fi
   echo "=== 1/2 内置策略 (builtin，不加载 JSON) ==="
   "./$BUILD_DIR/eval_disk" \
     --base data/sift/sift_base.fvecs \
@@ -216,6 +270,7 @@ run_compare() {
     --base-limit "$bl" \
     --query-limit "$ql" \
     --policy-mode builtin \
+    "${ram_args[@]}" \
     --rebuild 1 \
     --log logs/compare_builtin_summary.log \
     --metrics-log logs/compare_builtin_per_query.csv
@@ -229,6 +284,7 @@ run_compare() {
     --query-limit "$ql" \
     --policy-mode learned \
     --agent-policy data/agent_io_policy.json \
+    "${ram_args[@]}" \
     --rebuild 0 \
     --log logs/compare_learned_summary.log \
     --metrics-log logs/compare_learned_per_query.csv
@@ -260,6 +316,14 @@ case "$cmd" in
   build) run_build ;;
   test) run_test ;;
   bench) run_bench ;;
+  probe-dataset)
+    shift
+    run_probe_dataset "$@"
+    ;;
+  build-index)
+    shift
+    run_build_index "$@"
+    ;;
   eval)
     shift
     run_eval "$@"

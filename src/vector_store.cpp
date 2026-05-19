@@ -1,11 +1,13 @@
 #include "vector_store.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cmath>
 #include <cstdio>
 #include <queue>
 #include <unordered_set>
 
+#include "runtime/static_subgraph.h"
 #include "util/macros.h"
 #include "util/topk.h"
 
@@ -37,8 +39,9 @@ uint64_t pick_closest(const std::vector<std::pair<uint64_t, float>> &w) {
 std::vector<std::pair<uint64_t, float>>
 disk_search_layer(index::IndexFile &file, cache::GraphAwareCache &cache,
                   prefetch::IoUringBackend *uring, prefetch::TopologyPrefetcher &prefetch,
-                  uint64_t ep, const std::vector<float> &q, size_t ef, int layer,
-                  size_t dim, uint64_t total_nodes,
+                  const index::ExternalVectorStore *ext_vecs, uint64_t ep,
+                  const std::vector<float> &q, size_t ef, int layer, size_t dim,
+                  uint64_t total_nodes,
                   float (*dist_block)(const std::vector<float> &, const index::NodeBlock &,
                                       size_t)) {
   struct Item {
@@ -66,7 +69,8 @@ disk_search_layer(index::IndexFile &file, cache::GraphAwareCache &cache,
   }
   prefetch.on_visit_node(epb, static_cast<uint8_t>(layer));
 
-  const float d0 = dist_block(q, epb, dim);
+  const float d0 =
+      (ext_vecs && ext_vecs->ok()) ? ext_vecs->l2_sq(q, ep) : dist_block(q, epb, dim);
   candidates.push(Item{d0, ep});
   topk.push(Item{d0, ep});
   visited.insert(ep);
@@ -92,7 +96,8 @@ disk_search_layer(index::IndexFile &file, cache::GraphAwareCache &cache,
         index::NodeBlock nbk{};
         if (!cache.get_or_load(&file, uring, nb, &nbk))
           continue;
-        const float d = dist_block(q, nbk, dim);
+        const float d = (ext_vecs && ext_vecs->ok()) ? ext_vecs->l2_sq(q, nb)
+                                                     : dist_block(q, nbk, dim);
         if (topk.size() < ef || d < topk.top().d) {
           candidates.push(Item{d, nb});
           topk.push(Item{d, nb});
@@ -118,7 +123,13 @@ VectorStore::VectorStore(const Config &cfg)
     : cfg_(cfg),
       index_(128, 16, 200, 42),
       io_policy_(policy::AgentIoPolicy::from_config(cfg)),
-      cache_(cfg.cache_size_mb * 1024ull * 1024ull, &io_policy_, &io_metrics_),
+      cache_(cfg.cache_size_mb * 1024ull * 1024ull,
+             (cfg.static_cache_mb > 0
+                  ? cfg.static_cache_mb
+                  : std::max<size_t>(
+                        1, cfg.partition.pools.static_cache_bytes / (1024 * 1024))) *
+                 1024ull * 1024ull,
+             &io_policy_, &io_metrics_),
       prefetch_(cfg.prefetch_depth, &io_policy_, &io_metrics_),
       memtable_(cfg.memtable_limit_mb * 1024ull * 1024ull) {}
 
@@ -142,6 +153,19 @@ bool VectorStore::open() {
     return false;
   if (!file_.read_header(&header_))
     return false;
+
+  ext_vecs_.reset();
+  if (index::header_uses_external_vectors(header_)) {
+    ext_vecs_ = std::make_unique<index::ExternalVectorStore>();
+    if (!ext_vecs_->attach(file_.fd(), header_, cfg_.index_path)) {
+      std::fprintf(stderr, "external vector section attach failed (dim=%u)\n", header_.dim);
+      ext_vecs_.reset();
+    } else {
+      std::fprintf(stderr, "external vectors: dim=%u stride=%u enc=%u\n", header_.dim,
+                   header_.vector_stride_bytes,
+                   static_cast<unsigned>(header_.vector_encoding));
+    }
+  }
 
   if (cfg_.enable_wal) {
     wal_ = std::make_unique<write::Wal>(cfg_.index_path + ".wal");
@@ -177,6 +201,20 @@ bool VectorStore::open() {
 #else
   prefetch_.set_io_backend(nullptr);
 #endif
+
+  if (cfg_.enable_static_subgraph_pin && header_.total_nodes > 0) {
+    const uint64_t budget =
+        cfg_.partition.pools.static_cache_bytes > 0
+            ? cfg_.partition.pools.static_cache_bytes
+            : cfg_.static_cache_mb * 1024ull * 1024ull;
+    const uint64_t pinned = runtime::pin_static_navigation_subgraph(
+        file_, cache_, uring_.get(), header_.entry_point, header_.max_layer,
+        header_.total_nodes, budget);
+    std::fprintf(stderr, "static subgraph: pinned_bytes=%llu pins=%llu budget=%llu\n",
+                 static_cast<unsigned long long>(pinned),
+                 static_cast<unsigned long long>(cache_.static_pins_count()),
+                 static_cast<unsigned long long>(budget));
+  }
   return true;
 }
 
@@ -262,14 +300,15 @@ std::vector<SearchResult> VectorStore::search_disk(const std::vector<float> &que
     ep = 0;
   const int ml = std::min(7, static_cast<int>(header_.max_layer));
   for (int lc = ml; lc > 0; lc--) {
-    auto w = disk_search_layer(file_, cache_, uring_.get(), prefetch_, ep, query, 1, lc,
-                               dim, total_nodes, &VectorStore::l2_sq_block);
+    auto w = disk_search_layer(file_, cache_, uring_.get(), prefetch_, ext_vecs_.get(), ep,
+                               query, 1, lc, dim, total_nodes, &VectorStore::l2_sq_block);
     if (!w.empty())
       ep = pick_closest(w);
   }
 
-  auto w0 = disk_search_layer(file_, cache_, uring_.get(), prefetch_, ep, query,
-                              cfg_.ef_search, 0, dim, total_nodes, &VectorStore::l2_sq_block);
+  auto w0 =
+      disk_search_layer(file_, cache_, uring_.get(), prefetch_, ext_vecs_.get(), ep, query,
+                      cfg_.ef_search, 0, dim, total_nodes, &VectorStore::l2_sq_block);
   std::sort(w0.begin(), w0.end(),
             [](const auto &a, const auto &b) { return a.second < b.second; });
   if (w0.size() > k)

@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "cache/graph_aware_cache.h"
+#include "index/external_vectors.h"
 #include "index/hnsw.h"
 #include "index/storage_layout.h"
 #include "policy/agent_io_policy.h"
@@ -17,6 +18,7 @@
 #include "write/memtable.h"
 #include "write/wal.h"
 #include "util/io_metrics.h"
+#include "runtime/memory_partition.h"
 
 namespace amio {
 
@@ -34,7 +36,13 @@ struct SearchResult {
 
 struct Config {
   std::string index_path = "data/sift_base.index";
+  /// Dynamic 热缓存池（MB）；0 时由 apply_partition_to_config 填充。
   size_t cache_size_mb = 512;
+  /// Static 常驻 pin 池（MB）。
+  size_t static_cache_mb = 0;
+  uint64_t ram_budget_bytes = 0;
+  runtime::PartitionDecision partition{};
+  bool enable_static_subgraph_pin = true;
   size_t prefetch_depth = 1;
   bool enable_wal = true;
   bool enable_compaction = true;
@@ -77,13 +85,19 @@ public:
 
   uint64_t cache_hits_total() const { return cache_.hits_total(); }
   uint64_t cache_misses_total() const { return cache_.misses_total(); }
+  uint64_t static_pins_count() const { return cache_.static_pins_count(); }
 
   const policy::AgentIoPolicy &effective_io_policy() const { return io_policy_; }
+  const runtime::PartitionDecision &partition() const { return cfg_.partition; }
+  bool uses_external_vectors() const {
+    return ext_vecs_ && ext_vecs_->ok();
+  }
 
 private:
   Config cfg_;
   index::IndexFile file_;
   index::IndexFileHeader header_{};
+  std::unique_ptr<index::ExternalVectorStore> ext_vecs_;
 
   mutable std::mutex index_mu_;
   index::HnswIndex index_;

@@ -31,6 +31,8 @@ public:
   /// 第 `layer` 层的邻居列表（只读）。
   const std::vector<uint64_t> &neighbors_at(int layer, uint64_t id) const;
 
+  const std::vector<float> &vector_at(uint64_t id) const { return vectors_.at(id); }
+
 private:
   static constexpr int kMaxLayers = 8;
 
