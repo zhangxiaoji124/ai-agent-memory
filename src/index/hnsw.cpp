@@ -19,8 +19,10 @@ float HnswIndex::l2_sq(const std::vector<float> &a, const std::vector<float> &b)
   return s;
 }
 
-HnswIndex::HnswIndex(size_t dim, size_t m, size_t ef_construction, uint64_t seed)
-    : dim_(dim), m_(m), ef_construction_(ef_construction), rng_(seed) {
+HnswIndex::HnswIndex(size_t dim, size_t m, size_t ef_construction, uint64_t seed,
+                     float prune_alpha)
+    : dim_(dim), m_(m), ef_construction_(ef_construction),
+      prune_alpha_(prune_alpha > 1.0f ? prune_alpha : 1.2f), rng_(seed) {
   layer_neighbors_.resize(kMaxLayers);
 }
 
@@ -112,41 +114,98 @@ uint64_t HnswIndex::pick_closest(const std::vector<std::pair<uint64_t, float>> &
   return it->first;
 }
 
+std::vector<uint64_t> HnswIndex::robust_prune(
+    uint64_t center_id,
+    std::vector<std::pair<uint64_t, float>> candidates, size_t cap) const {
+  if (cap == 0 || candidates.empty() || center_id >= vectors_.size()) {
+    return {};
+  }
+
+  std::sort(candidates.begin(), candidates.end(),
+            [](const auto &a, const auto &b) {
+              if (a.second != b.second) {
+                return a.second < b.second;
+              }
+              return a.first < b.first;
+            });
+
+  std::vector<std::pair<uint64_t, float>> deduped;
+  deduped.reserve(candidates.size());
+  for (const auto &c : candidates) {
+    if (c.first == center_id) {
+      continue;
+    }
+    if (!deduped.empty() && deduped.back().first == c.first) {
+      if (c.second < deduped.back().second) {
+        deduped.back().second = c.second;
+      }
+      continue;
+    }
+    deduped.push_back(c);
+  }
+
+  std::vector<uint64_t> result;
+  result.reserve(std::min(cap, deduped.size()));
+
+  for (const auto &cand : deduped) {
+    if (result.size() >= cap) {
+      break;
+    }
+    const float dist_cp = cand.second;
+    bool occluded = false;
+    for (uint64_t sel : result) {
+      const float dist_cs = l2_sq(vectors_[static_cast<size_t>(cand.first)],
+                                  vectors_[static_cast<size_t>(sel)]);
+      if (dist_cs <= prune_alpha_ * dist_cp) {
+        occluded = true;
+        break;
+      }
+    }
+    if (!occluded) {
+      result.push_back(cand.first);
+    }
+  }
+  return result;
+}
+
 std::vector<uint64_t>
-HnswIndex::select_neighbors(const std::vector<std::pair<uint64_t, float>> &w, int layer) const {
-  auto sorted = w;
-  std::sort(sorted.begin(), sorted.end(),
-            [](const auto &a, const auto &b) { return a.second < b.second; });
-  const size_t cap = max_neighbors_for_layer(layer);
-  std::vector<uint64_t> out;
-  out.reserve(std::min(cap, sorted.size()));
-  for (size_t i = 0; i < sorted.size() && out.size() < cap; i++)
-    out.push_back(sorted[i].first);
-  return out;
+HnswIndex::select_neighbors(uint64_t center_id,
+                            const std::vector<std::pair<uint64_t, float>> &w,
+                            int layer) const {
+  return robust_prune(center_id, w, max_neighbors_for_layer(layer));
 }
 
 void HnswIndex::add_edge(int layer, uint64_t a, uint64_t b) {
-  if (a == b)
+  if (a == b) {
     return;
+  }
   if (node_level_[static_cast<size_t>(a)] < layer ||
-      node_level_[static_cast<size_t>(b)] < layer)
+      node_level_[static_cast<size_t>(b)] < layer) {
     return;
+  }
 
-  auto push = [&](uint64_t x, uint64_t y) {
-    auto &lst = layer_neighbors_[static_cast<size_t>(layer)][static_cast<size_t>(x)];
-    const size_t cap = max_neighbors_for_layer(layer);
-    if (std::find(lst.begin(), lst.end(), y) != lst.end())
-      return;
-    if (lst.size() < cap) {
-      lst.push_back(y);
+  auto try_add = [&](uint64_t x, uint64_t y) {
+    if (node_level_[static_cast<size_t>(x)] < layer) {
       return;
     }
-    // 邻居已满时，用 FIFO 方式让新边有机会进入，避免图“冻结”在早期节点。
-    lst.erase(lst.begin());
-    lst.push_back(y);
+    auto &lst = layer_neighbors_[static_cast<size_t>(layer)][static_cast<size_t>(x)];
+    if (std::find(lst.begin(), lst.end(), y) != lst.end()) {
+      return;
+    }
+
+    const size_t cap = max_neighbors_for_layer(layer);
+    const auto &vx = vectors_[static_cast<size_t>(x)];
+    std::vector<std::pair<uint64_t, float>> cand;
+    cand.reserve(lst.size() + 1);
+    for (uint64_t nb : lst) {
+      cand.push_back({nb, l2_sq(vx, vectors_[static_cast<size_t>(nb)])});
+    }
+    cand.push_back({y, l2_sq(vx, vectors_[static_cast<size_t>(y)])});
+    lst = robust_prune(x, std::move(cand), cap);
   };
-  push(a, b);
-  push(b, a);
+
+  try_add(a, b);
+  try_add(b, a);
 }
 
 int HnswIndex::node_max_layer(uint64_t id) const {
@@ -195,7 +254,7 @@ void HnswIndex::insert(uint64_t id, std::vector<float> vec) {
   uint64_t ep_conn = ep;
   for (int lc = cur_level; lc >= 0; lc--) {
     auto w = search_layer(ep_conn, q, ef_construction_, lc);
-    const auto neigh = select_neighbors(w, lc);
+    const auto neigh = select_neighbors(id, w, lc);
     for (uint64_t nb : neigh)
       add_edge(lc, id, nb);
     ep_conn = w.empty() ? ep_conn : pick_closest(w);

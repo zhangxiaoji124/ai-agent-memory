@@ -55,6 +55,8 @@ struct PartitionDecision {
 uint64_t default_stream_batch(MemoryPartitionProfile p);
 
 VectorFileKind detect_kind_by_extension(const std::string &path);
+VectorFileKind detect_kind_by_content(const std::string &path);
+VectorFileKind detect_vector_file_kind(const std::string &path);
 
 bool probe_vector_file(const std::string &path, VectorFileKind kind, uint32_t *dim_out,
                        uint64_t *num_vectors_est_out);

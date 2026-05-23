@@ -8,10 +8,13 @@
 namespace amio::index {
 
 /// 多层 HNSW（最多 8 层，与 `NodeBlock` 中邻居表对齐）。
+/// 构图采用 DiskANN/Vamana 的 RobustPrune 多样性剪枝；邻居满时按距离重剪枝，不用 FIFO。
 class HnswIndex {
 public:
   /// `m`：高层邻居上限；Layer0 使用 `2*m`。
-  HnswIndex(size_t dim, size_t m, size_t ef_construction, uint64_t seed);
+  /// `prune_alpha`：RobustPrune 遮挡系数（典型 1.0–1.5，越大图越稀疏、多样性越强）。
+  HnswIndex(size_t dim, size_t m, size_t ef_construction, uint64_t seed,
+            float prune_alpha = 1.2f);
 
   size_t dim() const { return dim_; }
   size_t size() const { return vectors_.size(); }
@@ -39,6 +42,7 @@ private:
   size_t dim_ = 0;
   size_t m_ = 0;
   size_t ef_construction_ = 0;
+  float prune_alpha_ = 1.2f;
 
   int max_layer_ = -1;
   uint64_t entry_point_ = 0;
@@ -58,7 +62,14 @@ private:
   std::vector<std::pair<uint64_t, float>> search_layer(uint64_t ep, const std::vector<float> &q,
                                                        size_t ef, int layer) const;
   static uint64_t pick_closest(const std::vector<std::pair<uint64_t, float>> &w);
-  std::vector<uint64_t> select_neighbors(const std::vector<std::pair<uint64_t, float>> &w,
+
+  /// DiskANN RobustPrune：按到 center 的距离排序，剔除被已选邻居“遮挡”的候选。
+  std::vector<uint64_t> robust_prune(uint64_t center_id,
+                                     std::vector<std::pair<uint64_t, float>> candidates,
+                                     size_t cap) const;
+
+  std::vector<uint64_t> select_neighbors(uint64_t center_id,
+                                         const std::vector<std::pair<uint64_t, float>> &w,
                                          int layer) const;
   void add_edge(int layer, uint64_t a, uint64_t b);
 };

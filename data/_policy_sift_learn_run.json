@@ -1,0 +1,27 @@
+{
+  "agent_profile": "cursor",
+  "prefetch_depth_upper": 2,
+  "prefetch_depth_layer0": 2,
+  "max_neighbor_fanout_layer0": 32,
+  "use_layer_aware_prefetch": false,
+  "sort_prefetch_by_disk_offset": false,
+  "hot_insert_min_prior_misses": 1,
+  "_meta": {
+    "trainer": "train_agent_policy.py",
+    "data_source": "learn-fvecs",
+    "papers_mapping": "GoVector/SARC/PAIC/Baleen/一次性访问排除 → 分层预取+顺序化+二次准入",
+    "tree_probe": "sklearn_tree feature_importances=[1.0, 0.0, 0.0, 0.0]",
+    "learn_fvecs": "data/sift/sift_learn.fvecs",
+    "learn_vectors_loaded": 80000,
+    "learn_traces": 120,
+    "trace_steps": 200,
+    "learn_pool_size": 256,
+    "aggregate_trace_stats": {
+      "mean_fanout": 13.538375,
+      "std_fanout": 3.954941,
+      "seq_locality": 0.0,
+      "high_layer_share": 0.0
+    },
+    "policy_cluster": 1
+  }
+}
