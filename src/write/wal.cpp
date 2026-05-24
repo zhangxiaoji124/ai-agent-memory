@@ -76,4 +76,15 @@ bool Wal::append(uint64_t node_id, const std::vector<float> &vec) {
   return true;
 }
 
+bool Wal::truncate() {
+  if (!ok_)
+    return false;
+  std::lock_guard lk(mu_);
+#if defined(_WIN32)
+  return _chsize_s(fd_, 0) == 0;
+#else
+  return ::ftruncate(fd_, 0) == 0;
+#endif
+}
+
 } // namespace amio::write

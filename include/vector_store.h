@@ -15,7 +15,11 @@
 #include "prefetch/io_uring_backend.h"
 #include "prefetch/topology_prefetcher.h"
 #include "write/compaction.h"
+#include "write/index_merger.h"
 #include "write/memtable.h"
+#include "write/noblsm_commit.h"
+#include "write/nvtable.h"
+#include "write/remap_com.h"
 #include "write/wal.h"
 #include "util/io_metrics.h"
 #include "runtime/memory_partition.h"
@@ -46,6 +50,9 @@ struct Config {
   size_t prefetch_depth = 1;
   bool enable_wal = true;
   bool enable_compaction = true;
+  bool enable_nvtable = true;
+  bool enable_noblsm = true;
+  bool enable_isvm_kv_cache = true;
   bool enable_memtable_search = true;
   bool force_disable_uring = false;
   size_t memtable_limit_mb = 64;
@@ -87,6 +94,9 @@ public:
   uint64_t cache_misses_total() const { return cache_.misses_total(); }
   uint64_t static_pins_count() const { return cache_.static_pins_count(); }
 
+  /// 等待 compaction 队列清空（测试 / 关闭前刷盘）。
+  void flush_writes();
+
   const policy::AgentIoPolicy &effective_io_policy() const { return io_policy_; }
   const runtime::PartitionDecision &partition() const { return cfg_.partition; }
   bool uses_external_vectors() const {
@@ -109,8 +119,16 @@ private:
   std::unique_ptr<prefetch::IoUringBackend> uring_;
 
   write::MemTable memtable_;
+  write::NVTable nvtable_;
+  write::RemapComTracker remap_;
+  write::NobLsmCommitTracker noblsm_;
   std::unique_ptr<write::Wal> wal_;
   std::unique_ptr<write::CompactionWorker> compaction_;
+  uint64_t next_node_id_ = 0;
+  bool index_writable_ = false;
+
+  void submit_compaction_batch(write::CompactionWorker::Batch batch);
+  void on_compaction_applied(const write::IndexMergeStats &st);
 
   static float l2_sq(const std::vector<float> &a, const std::vector<float> &b);
   static float l2_sq_block(const std::vector<float> &q,

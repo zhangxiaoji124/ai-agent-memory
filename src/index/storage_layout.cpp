@@ -37,6 +37,22 @@ static int open_rdonly(const char *path) {
 #endif
 }
 
+static int open_rdwr_existing(const char *path) {
+#if defined(_WIN32)
+  int mode = 0;
+#if defined(_S_IREAD) && defined(_S_IWRITE)
+  mode = _S_IREAD | _S_IWRITE;
+#elif defined(S_IREAD) && defined(S_IWRITE)
+  mode = S_IREAD | S_IWRITE;
+#else
+  mode = 0666;
+#endif
+  return _open(path, _O_BINARY | _O_RDWR, mode);
+#else
+  return ::open(path, O_RDWR);
+#endif
+}
+
 static int open_create_trunc_fd(const char *path) {
 #if defined(_WIN32)
   int mode = 0;
@@ -56,6 +72,12 @@ static int open_create_trunc_fd(const char *path) {
 bool IndexFile::open_readonly(const std::string &path) {
   close();
   fd_ = open_rdonly(path.c_str());
+  return fd_ >= 0;
+}
+
+bool IndexFile::open_readwrite(const std::string &path) {
+  close();
+  fd_ = open_rdwr_existing(path.c_str());
   return fd_ >= 0;
 }
 

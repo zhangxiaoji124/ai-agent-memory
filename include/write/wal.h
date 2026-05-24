@@ -19,6 +19,9 @@ public:
 
   bool append(uint64_t node_id, const std::vector<float> &vec);
 
+  /// NobLSM：异步提交完成后截断 WAL（非阻塞语义）。
+  bool truncate();
+
 private:
   int fd_ = -1;
   bool ok_ = false;

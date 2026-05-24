@@ -4,10 +4,16 @@
 #include <limits>
 #include <mutex>
 
+#include "cache/isvm_scorer.h"
 #include "prefetch/io_uring_backend.h"
 #include "util/io_metrics.h"
 
 namespace amio::cache {
+
+static uint32_t estimate_kv_group_bytes(const amio::index::NodeBlock &b) {
+  const uint8_t cnt = b.neighbor_counts[0];
+  return static_cast<uint32_t>(cnt) * static_cast<uint32_t>(sizeof(uint32_t));
+}
 
 GraphAwareCache::GraphAwareCache(size_t dynamic_capacity_bytes, size_t pinned_capacity_bytes,
                                  const policy::AgentIoPolicy *policy,
@@ -148,6 +154,7 @@ void GraphAwareCache::insert_hot_locked(uint64_t node_id, const amio::index::Nod
   e.block = b;
   e.tick = ++tick_;
   e.is_prefetch_loaded = is_prefetch_loaded;
+  e.kv_group_bytes = estimate_kv_group_bytes(b);
   if (hot_.find(node_id) == hot_.end()) {
     hot_used_bytes_ += amio::index::kBlockSize;
   }
@@ -155,15 +162,25 @@ void GraphAwareCache::insert_hot_locked(uint64_t node_id, const amio::index::Nod
   evict_if_needed_locked();
 }
 
+void GraphAwareCache::set_isvm_kv_cache_enabled(bool enabled) {
+  std::unique_lock lk(mu_);
+  isvm_.set_enabled(enabled);
+}
+
 void GraphAwareCache::evict_if_needed_locked() {
   if (dynamic_capacity_bytes_ == 0)
     return;
   while (hot_used_bytes_ > dynamic_capacity_bytes_ && !hot_.empty()) {
     uint64_t victim = 0;
-    uint64_t best = std::numeric_limits<uint64_t>::max();
+    int32_t best_score = std::numeric_limits<int32_t>::min();
+    uint64_t oldest_tick = std::numeric_limits<uint64_t>::max();
     for (const auto &kv : hot_) {
-      if (kv.second.tick < best) {
-        best = kv.second.tick;
+      const uint64_t age = tick_ - kv.second.tick;
+      const int32_t score =
+          isvm_.eviction_score(kv.second.is_prefetch_loaded, age, kv.second.kv_group_bytes);
+      if (score > best_score || (score == best_score && kv.second.tick < oldest_tick)) {
+        best_score = score;
+        oldest_tick = kv.second.tick;
         victim = kv.first;
       }
     }

@@ -23,7 +23,8 @@
 | 离线策略学习（`train_agent_policy.py`） | R11 | sklearn 聚类 → `agent_io_policy.json`；含 memory_profile、partition_theta |
 | `eval_disk` 评测工具 | R12 | QPS / P50/P95/P99 / Recall@k；逐查询 CSV；`theta_phase_switches` 列 |
 | DiskANN RobustPrune HNSW 构图 | — | `build_index` 流式分批构图，支持 bvec + dim > 128 |
-| WAL + MemTable + CompactionWorker | 写优化骨架 | 实时插入缓冲；WAL 顺序刷盘 |
+| WAL + MemTable + CompactionWorker | 写优化 | NVTable 链表缓冲、NobLSM 异步提交、RemapCom UDB、**增量写回 `.index`** |
+| **KV Group + ISVM 缓存驱逐** | R8 简化 | layer0 邻居组字节估算 + 整数线性 ISVM 驱逐分 |
 | **PAIC 预取有效性追踪** | R8 简化 | `useful_prefetch_demand_hits` / `wasted_prefetch_evictions`；`prefetch_utilization_rate` 写入汇总 |
 | **BFS 图重排** | R9 简化 | `reorder_index` BFS 重排节点顺序；`compare-reorder` 一键量化 I/O 局部性改善 |
 | Linux 一键测试脚本 | R12 | `scripts/linux_run.sh all/compare/eval-quick/reorder/compare-reorder` |
@@ -54,8 +55,8 @@
 |--------|------|-----------|
 | ~~P1~~ 已完成 | ~~PAIC~~ demand/prefetch 计数（useful_hits / wasted_evictions）已落地；KV Group 粒度缓存与 ISVM 替换策略仍为研究级 | § 读优化（一）R8 |
 | ~~P1~~ 已完成 | ~~图重排（BFS 简化版）~~已落地（`reorder_index`）；Gorder/Porder 权重重排为研究级 | § 读优化（二）R9 |
-| P2 | RemapCom 零拷贝合并 / NobLSM 非阻塞提交 / NVTable | § 写优化 R10 |
-| P2 | LangChain / LlamaIndex Python VectorStore 封装 | § 透明集成 |
+| P2 | LangChain / LlamaIndex Python VectorStore 封装 | § 透明集成（`python/amio` 已提供 ctypes 基础） |
+| ~~P2 部分~~ | ~~RemapCom / NobLSM / NVTable~~ | 简化版已落地；完整内核协同仍为后续 |
 | — | 全量 500 GB bvec 端到端评测 + `--ram-budget-gb 100` 口径文档 | R7/R12 |
 
 ---

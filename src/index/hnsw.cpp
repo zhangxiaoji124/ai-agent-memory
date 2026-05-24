@@ -225,7 +225,7 @@ const std::vector<uint64_t> &HnswIndex::neighbors_at(int layer, uint64_t id) con
 }
 
 void HnswIndex::insert(uint64_t id, std::vector<float> vec) {
-  if (id != vectors_.size() || vec.size() != dim_)
+  if (id != id_base_ + vectors_.size() || vec.size() != dim_)
     return;
 
   const int cur_level = random_level();

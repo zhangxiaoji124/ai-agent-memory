@@ -62,6 +62,8 @@ public:
   IndexFile &operator=(const IndexFile &) = delete;
 
   bool open_readonly(const std::string &path);
+  /// 读写打开已有索引（compaction 增量写回）。
+  bool open_readwrite(const std::string &path);
   bool open_create_trunc(const std::string &path);
   void close();
 

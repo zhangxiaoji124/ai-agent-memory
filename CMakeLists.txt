@@ -20,6 +20,11 @@ add_library(amio
   src/write/memtable.cpp
   src/write/wal.cpp
   src/write/compaction.cpp
+  src/write/index_merger.cpp
+  src/write/nvtable.cpp
+  src/write/noblsm_commit.cpp
+  src/write/remap_com.cpp
+  src/cache/isvm_scorer.cpp
   src/dataset/fvecs.cpp
   src/dataset/vector_dataset.cpp
   src/dataset/index_builder.cpp
@@ -62,6 +67,7 @@ add_executable(run_tests
   tests/concurrent_test.cpp
   tests/memory_partition_test.cpp
   tests/high_dim_index_test.cpp
+  tests/compaction_merge_test.cpp
 )
 target_link_libraries(run_tests PRIVATE amio)
 

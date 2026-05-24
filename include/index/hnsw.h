@@ -21,8 +21,12 @@ public:
   uint64_t entry_point() const { return entry_point_; }
   int max_layer() const { return max_layer_; }
 
-  /// 插入：`id` 必须等于当前 `size()`（连续 ID）。
+  /// 插入：`id` 必须等于 `id_base() + size()`（连续 ID，可带全局偏移）。
   void insert(uint64_t id, std::vector<float> vec);
+
+  /// 全局 ID 起始偏移（磁盘索引已有节点数）。
+  void set_id_base(uint64_t base) { id_base_ = base; }
+  uint64_t id_base() const { return id_base_; }
 
   /// 近似检索 Top-K。
   std::vector<std::pair<uint64_t, float>> search(const std::vector<float> &query,
@@ -46,6 +50,7 @@ private:
 
   int max_layer_ = -1;
   uint64_t entry_point_ = 0;
+  uint64_t id_base_ = 0;
 
   std::vector<std::vector<float>> vectors_;
   std::vector<int> node_level_; // 每个节点的最高层

@@ -155,9 +155,10 @@ VectorStore::VectorStore(const Config &cfg)
                  1024ull * 1024ull,
              &io_policy_, &io_metrics_),
       prefetch_(cfg.prefetch_depth, &io_policy_, &io_metrics_),
-      memtable_(cfg.memtable_limit_mb * 1024ull * 1024ull) {
-  // PAIC: 连接预取器与缓存，使预取提交记录可观测
+      memtable_(cfg.memtable_limit_mb * 1024ull * 1024ull),
+      nvtable_(cfg.memtable_limit_mb * 1024ull * 1024ull * 2) {
   prefetch_.set_cache(&cache_);
+  cache_.set_isvm_kv_cache_enabled(cfg.enable_isvm_kv_cache);
 }
 
 VectorStore::~VectorStore() = default;
@@ -176,10 +177,22 @@ bool VectorStore::open() {
     }
   }
 
-  if (!file_.open_readonly(cfg_.index_path))
+  if (cfg_.enable_compaction) {
+    if (!file_.open_readwrite(cfg_.index_path)) {
+      if (!file_.open_readonly(cfg_.index_path)) {
+        return false;
+      }
+      index_writable_ = false;
+    } else {
+      index_writable_ = true;
+    }
+  } else if (!file_.open_readonly(cfg_.index_path)) {
     return false;
-  if (!file_.read_header(&header_))
+  }
+  if (!file_.read_header(&header_)) {
     return false;
+  }
+  next_node_id_ = header_.total_nodes;
 
   ext_vecs_.reset();
   if (index::header_uses_external_vectors(header_)) {
@@ -202,14 +215,32 @@ bool VectorStore::open() {
     std::lock_guard lk(index_mu_);
     index_ = index::HnswIndex(static_cast<size_t>(header_.dim), header_.m ? header_.m : 16,
                               header_.ef_construction ? header_.ef_construction : 200, 42);
+    index_.set_id_base(header_.total_nodes);
   }
 
   if (cfg_.enable_compaction) {
     compaction_ = std::make_unique<write::CompactionWorker>(
         [this](const write::CompactionWorker::Batch &batch) {
-          std::lock_guard lk(index_mu_);
-          for (const auto &kv : batch)
-            index_.insert(kv.first, kv.second);
+          write::IndexMergeStats st{};
+          {
+            std::lock_guard lk(index_mu_);
+            if (index_writable_ && file_.fd() >= 0) {
+              st = write::merge_batch_into_index(file_, header_, index_, batch,
+                                                 cfg_.enable_compaction ? &remap_ : nullptr);
+            } else {
+              for (const auto &kv : batch) {
+                if (kv.first == index_.id_base() + index_.size() &&
+                    kv.second.size() == header_.dim) {
+                  index_.insert(kv.first, kv.second);
+                }
+              }
+              st.ok = true;
+              st.nodes_merged = batch.size();
+            }
+          }
+          if (st.ok) {
+            on_compaction_applied(st);
+          }
         });
   }
 
@@ -296,18 +327,82 @@ std::vector<SearchResult> VectorStore::search(const std::vector<float> &query,
 }
 
 bool VectorStore::insert(uint64_t id, const std::vector<float> &vec) {
-  if (wal_) {
-    (void)wal_->append(id, vec);
-  }
-  const bool need_flush = memtable_.insert(id, vec);
-  if (need_flush && compaction_) {
-    compaction_->submit(memtable_.drain());
-  }
-  if (!need_flush) {
+  uint64_t nid = id;
+  {
     std::lock_guard lk(index_mu_);
-    index_.insert(id, vec);
+    if (file_.fd() >= 0) {
+      if (nid < next_node_id_) {
+        nid = next_node_id_;
+      } else if (nid > next_node_id_) {
+        nid = next_node_id_;
+      }
+      next_node_id_++;
+    }
+  }
+
+  if (wal_) {
+    (void)wal_->append(nid, vec);
+  }
+  const bool need_flush = memtable_.insert(nid, vec);
+  if (need_flush) {
+    auto batch = memtable_.drain();
+    if (cfg_.enable_nvtable) {
+      const bool nv_full = nvtable_.append_slice(std::move(batch));
+      if (nv_full || nvtable_.slice_count() >= 4) {
+        submit_compaction_batch(nvtable_.drain_all());
+      }
+    } else {
+      submit_compaction_batch(std::move(batch));
+    }
+  } else if (!cfg_.enable_compaction || !index_writable_) {
+    std::lock_guard lk(index_mu_);
+    if (nid == index_.id_base() + index_.size() &&
+        vec.size() == (header_.dim ? header_.dim : vec.size())) {
+      index_.insert(nid, vec);
+    }
   }
   return true;
+}
+
+void VectorStore::submit_compaction_batch(write::CompactionWorker::Batch batch) {
+  if (batch.empty()) {
+    return;
+  }
+  if (compaction_) {
+    compaction_->submit(std::move(batch));
+  }
+}
+
+void VectorStore::on_compaction_applied(const write::IndexMergeStats &st) {
+  if (!st.ok) {
+    return;
+  }
+  if (cfg_.enable_noblsm && wal_) {
+    const std::string wal_path = cfg_.index_path + ".wal";
+    noblsm_.check_commit(wal_path);
+    noblsm_.mark_data_written(wal_path);
+    noblsm_.mark_data_written(cfg_.index_path);
+    for (const auto &p : noblsm_.poll_committed()) {
+      if (p == wal_path) {
+        (void)wal_->truncate();
+      }
+    }
+  }
+  std::fprintf(stderr,
+               "compaction: merged=%llu blocks_written=%llu remapped=%llu total_nodes=%llu\n",
+               static_cast<unsigned long long>(st.nodes_merged),
+               static_cast<unsigned long long>(st.blocks_written),
+               static_cast<unsigned long long>(st.blocks_remapped),
+               static_cast<unsigned long long>(header_.total_nodes));
+}
+
+void VectorStore::flush_writes() {
+  if (cfg_.enable_nvtable && !nvtable_.empty()) {
+    submit_compaction_batch(nvtable_.drain_all());
+  }
+  if (compaction_) {
+    compaction_->flush();
+  }
 }
 
 std::vector<SearchResult> VectorStore::search_disk(const std::vector<float> &query,

@@ -12,6 +12,7 @@
 
 #include "index/storage_layout.h"
 #include "policy/agent_io_policy.h"
+#include "cache/isvm_scorer.h"
 
 namespace amio {
 struct IoMetrics;
@@ -34,6 +35,7 @@ namespace amio::cache {
 ///    并清除标记（需求已消费该预取）。
 ///  - evict_if_needed_locked() 淘汰仍标记条目时，计入
 ///    io_metrics_->wasted_prefetch_evictions（条目在需求到来前被逐出）。
+///  - KV Group：以 layer0 邻居子集为粒度缓存元数据，配合 ISVM 做 size-aware 驱逐。
 class GraphAwareCache {
 public:
   /// @param dynamic_capacity_bytes  Dynamic/hot LRU 池上限
@@ -78,6 +80,8 @@ public:
   /// 集合上限 kMaxPrefetchPending，超出时清空以防无界增长。
   void record_prefetch_submitted(const std::vector<uint64_t> &ids);
 
+  void set_isvm_kv_cache_enabled(bool enabled);
+
 private:
   static constexpr size_t kMaxPrefetchPending = 32768;
 
@@ -94,6 +98,7 @@ private:
     amio::index::NodeBlock block{};
     uint64_t tick = 0;
     bool is_prefetch_loaded = false; // PAIC: 该条目由预取协同触发加载
+    uint32_t kv_group_bytes = 0;     // GroupCache: layer0 邻居组字节估算
   };
   std::unordered_map<uint64_t, HotEntry> hot_;
   uint64_t tick_ = 0;
@@ -113,6 +118,7 @@ private:
   const policy::AgentIoPolicy *policy_ = nullptr;
   ::amio::IoMetrics *io_metrics_ = nullptr;
   std::unordered_map<uint64_t, uint32_t> cold_misses_;
+  IsvmScorer isvm_{};
 };
 
 } // namespace amio::cache
