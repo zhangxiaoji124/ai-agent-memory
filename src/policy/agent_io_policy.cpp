@@ -18,6 +18,8 @@ AgentIoPolicy AgentIoPolicy::from_config(const Config &cfg) {
   p.use_layer_aware_prefetch = false;
   p.sort_prefetch_by_disk_offset = false;
   p.hot_insert_min_prior_misses = 1;
+  // 从内存划分区分器传入的 θ（GoVector 阶段切换比例）
+  p.partition_theta = cfg.partition.partition_theta;
   return p;
 }
 
@@ -78,6 +80,26 @@ bool extract_json_uint(const std::string &json, const char *key, size_t *out) {
   if (end == json.c_str() + pos)
     return false;
   *out = static_cast<size_t>(v);
+  return true;
+}
+
+bool extract_json_float(const std::string &json, const char *key, float *out) {
+  const std::string needle = std::string("\"") + key + "\"";
+  size_t pos = json.find(needle);
+  if (pos == std::string::npos)
+    return false;
+  pos = json.find(':', pos + needle.size());
+  if (pos == std::string::npos)
+    return false;
+  ++pos;
+  while (pos < json.size() &&
+         std::isspace(static_cast<unsigned char>(json[pos])))
+    ++pos;
+  char *end = nullptr;
+  const float v = std::strtof(json.c_str() + pos, &end);
+  if (end == json.c_str() + pos)
+    return false;
+  *out = v;
   return true;
 }
 
@@ -153,6 +175,15 @@ bool AgentIoPolicy::merge_json_file(const std::string &path, AgentIoPolicy *out,
     if (v > 64)
       v = 64;
     out->hot_insert_min_prior_misses = static_cast<uint32_t>(v);
+  }
+
+  float fv = 0.0f;
+  if (extract_json_float(json, "partition_theta", &fv)) {
+    if (fv < 0.0f)
+      fv = 0.0f;
+    if (fv > 1.0f)
+      fv = 1.0f;
+    out->partition_theta = fv;
   }
 
   return true;

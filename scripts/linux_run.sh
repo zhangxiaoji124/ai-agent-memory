@@ -55,9 +55,13 @@ Linux 运行脚本（agent-memory-io-cpp）
   bench             运行 bench_search 与 bench_write
   probe-dataset     探测向量文件类型/维度/体量并打印内存划分模式（dataset_loader）
   build-index       流式/内存建索引（支持 fvecs/bvecs，dim>128 自动 v2 外置向量区）
+  reorder           BFS 图重排：对已有索引重排节点顺序，改善 layer0 空间局部性（降低随机 I/O）
+                    用法: reorder [--input src.index] [--output dst.index]
+                    默认: --input data/sift_base.index --output data/sift_base_reordered.index
   eval              运行 eval_disk，参数原样透传（支持 --ram-budget-gb、--memory-profile）
   eval-quick        小规模 eval_disk（自动内存划分 + learned 策略）
   compare           同一索引上先后跑 builtin 与 learned，生成 logs/compare_* 汇总与逐查询 CSV
+  compare-reorder   先重排索引，再对原始与重排索引分别跑 compare，量化重排收益
   smoke             build + test + bench
   all               deps + fetch-sift + policy + build + test + bench + eval-quick
 
@@ -291,6 +295,64 @@ run_compare() {
   echo "对比完成: logs/compare_*_summary.log 与 logs/compare_*_per_query.csv"
 }
 
+run_reorder() {
+  [[ -x "$BUILD_DIR/reorder_index" ]] || die "请先构建: ./scripts/linux_run.sh build"
+  local src="${1:-data/sift_base.index}"
+  local dst="${2:-data/sift_base_reordered.index}"
+  if [[ $# -ge 2 && "$1" == "--input" ]]; then
+    src="$2"
+    dst="${4:-${src%.index}_reordered.index}"
+    [[ $# -ge 4 && "$3" == "--output" ]] && dst="$4"
+  fi
+  echo "BFS 重排: $src → $dst"
+  "./$BUILD_DIR/reorder_index" --input "$src" --output "$dst"
+  echo "重排完成: $dst"
+  echo "提示: 用 eval --index $dst 与原索引对比 I/O 局部性改善效果"
+}
+
+run_compare_reorder() {
+  [[ -x "$BUILD_DIR/eval_disk" ]] || die "请先构建"
+  [[ -x "$BUILD_DIR/reorder_index" ]] || die "请先构建"
+  [[ -f data/sift/sift_base.fvecs ]] || die "请先: ./scripts/linux_run.sh fetch-sift"
+  mkdir -p logs
+  local idx_orig="${CMP_INDEX:-data/sift_compare.index}"
+  local idx_reordered="${idx_orig%.index}_reordered.index"
+  local bl="${CMP_BASE_LIMIT:-100000}"
+  local ql="${CMP_QUERY_LIMIT:-200}"
+  local pm_args=(--policy-mode builtin)
+  if [[ -f data/agent_io_policy.json ]]; then
+    pm_args=(--policy-mode learned --agent-policy data/agent_io_policy.json)
+  fi
+
+  echo "=== 1/3 构建原始索引 ==="
+  "./$BUILD_DIR/eval_disk" \
+    --base data/sift/sift_base.fvecs \
+    --query data/sift/sift_query.fvecs \
+    --gt data/sift/sift_groundtruth.ivecs \
+    --index "$idx_orig" --base-limit "$bl" --query-limit "$ql" \
+    "${pm_args[@]}" --rebuild 1 \
+    --log logs/compare_orig_summary.log \
+    --metrics-log logs/compare_orig_per_query.csv
+
+  echo "=== 2/3 BFS 重排索引 ==="
+  "./$BUILD_DIR/reorder_index" --input "$idx_orig" --output "$idx_reordered"
+
+  echo "=== 3/3 评测重排后索引 ==="
+  "./$BUILD_DIR/eval_disk" \
+    --base data/sift/sift_base.fvecs \
+    --query data/sift/sift_query.fvecs \
+    --gt data/sift/sift_groundtruth.ivecs \
+    --index "$idx_reordered" --base-limit "$bl" --query-limit "$ql" \
+    "${pm_args[@]}" --rebuild 0 \
+    --log logs/compare_reorder_summary.log \
+    --metrics-log logs/compare_reorder_per_query.csv
+
+  echo "对比完成:"
+  echo "  原始索引汇总:   logs/compare_orig_summary.log"
+  echo "  重排索引汇总:   logs/compare_reorder_summary.log"
+  echo "关键指标: sum_disk_sync_block_reads（越低越好）、avg_latency_ms"
+}
+
 run_smoke() {
   run_build
   run_test
@@ -330,6 +392,11 @@ case "$cmd" in
     ;;
   eval-quick) run_eval_quick ;;
   compare) run_compare ;;
+  reorder)
+    shift
+    run_reorder "$@"
+    ;;
+  compare-reorder) run_compare_reorder ;;
   smoke) run_smoke ;;
   all) run_all ;;
   *) die "未知子命令: $cmd（使用 help 查看用法）" ;;

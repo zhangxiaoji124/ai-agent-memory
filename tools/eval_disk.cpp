@@ -261,9 +261,12 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "读取 query 失败: %s\n", query_path.c_str());
     return 3;
   }
-  if (!amio::dataset::load_ivecs(gt_path, &gt_all) || gt_all.empty()) {
-    std::fprintf(stderr, "读取 groundtruth 失败: %s\n", gt_path.c_str());
-    return 4;
+  // 只在不自行重算 GT 时才需要加载 GT 文件（recompute_gt=true 时从 base 子集自行计算）
+  if (!recompute_gt) {
+    if (!amio::dataset::load_ivecs(gt_path, &gt_all) || gt_all.empty()) {
+      std::fprintf(stderr, "读取 groundtruth 失败: %s\n", gt_path.c_str());
+      return 4;
+    }
   }
 
   const size_t nbase = std::min(base_limit, base_all.size());
@@ -396,12 +399,16 @@ int main(int argc, char **argv) {
     }
     mq << "query_idx,latency_ms,recall_at_k,disk_sync_block_reads,"
           "disk_sync_read_bytes,disk_via_uring,disk_via_pread,"
-          "prefetch_blocks_submitted,cache_hits,cache_misses\n";
+          "prefetch_blocks_submitted,cache_hits,cache_misses,theta_phase_switches,"
+          "useful_prefetch_demand_hits,wasted_prefetch_evictions\n";
   }
 
   uint64_t sum_disk_blocks = 0;
   uint64_t sum_disk_bytes = 0;
   uint64_t sum_prefetch = 0;
+  uint64_t sum_theta_switches = 0;
+  uint64_t sum_useful_prefetch = 0;
+  uint64_t sum_wasted_prefetch = 0;
 
   uint64_t t0_ns = amio::util::now_ns();
   for (size_t i = 0; i < nq; i++) {
@@ -420,6 +427,9 @@ int main(int argc, char **argv) {
     sum_disk_blocks += snap.disk_sync_block_reads;
     sum_disk_bytes += snap.disk_sync_read_bytes;
     sum_prefetch += snap.prefetch_blocks_submitted;
+    sum_theta_switches += snap.theta_phase_switches;
+    sum_useful_prefetch += snap.useful_prefetch_demand_hits;
+    sum_wasted_prefetch += snap.wasted_prefetch_evictions;
     const uint64_t ch = store.cache_hits_total();
     const uint64_t cm = store.cache_misses_total();
     const double r1 =
@@ -429,7 +439,10 @@ int main(int argc, char **argv) {
       mq << i << ',' << std::fixed << std::setprecision(6) << lat_ms << ',' << r1
          << ',' << snap.disk_sync_block_reads << ',' << snap.disk_sync_read_bytes << ','
          << snap.disk_sync_via_uring << ',' << snap.disk_sync_via_pread << ','
-         << snap.prefetch_blocks_submitted << ',' << ch << ',' << cm << '\n';
+         << snap.prefetch_blocks_submitted << ',' << ch << ',' << cm << ','
+         << snap.theta_phase_switches << ','
+         << snap.useful_prefetch_demand_hits << ','
+         << snap.wasted_prefetch_evictions << '\n';
     }
   }
   uint64_t t1_ns = amio::util::now_ns();
@@ -497,6 +510,7 @@ int main(int argc, char **argv) {
   ofs << "pool_dynamic_mb=" << (part.pools.dynamic_cache_bytes / (1024 * 1024)) << "\n";
   ofs << "static_pins=" << store.static_pins_count() << "\n";
   ofs << "distance_kernel=" << part.distance_kernel << "\n";
+  ofs << "partition_theta=" << epol.partition_theta << "\n";
   ofs << "index_dim=" << store.partition().dataset.dim << "\n";
   ofs << "uses_external_vectors=" << (store.uses_external_vectors() ? 1 : 0) << "\n";
   ofs << "io_uring_active=" << (store.io_uring_active() ? 1 : 0) << "\n";
@@ -515,11 +529,24 @@ int main(int argc, char **argv) {
   ofs << "sum_disk_sync_block_reads=" << sum_disk_blocks << "\n";
   ofs << "sum_disk_sync_read_bytes=" << sum_disk_bytes << "\n";
   ofs << "sum_prefetch_blocks_submitted=" << sum_prefetch << "\n";
+  ofs << "sum_theta_phase_switches=" << sum_theta_switches << "\n";
+  ofs << "sum_useful_prefetch_demand_hits=" << sum_useful_prefetch << "\n";
+  ofs << "sum_wasted_prefetch_evictions=" << sum_wasted_prefetch << "\n";
+  const uint64_t total_prefetch_tracked = sum_useful_prefetch + sum_wasted_prefetch;
+  ofs << "prefetch_utilization_rate="
+      << (total_prefetch_tracked > 0
+              ? static_cast<double>(sum_useful_prefetch) /
+                    static_cast<double>(total_prefetch_tracked)
+              : 0.0)
+      << "\n";
   ofs << "avg_disk_sync_blocks_per_query="
       << (nq ? static_cast<double>(sum_disk_blocks) / static_cast<double>(nq) : 0.0)
       << "\n";
   ofs << "avg_prefetch_blocks_submitted_per_query="
       << (nq ? static_cast<double>(sum_prefetch) / static_cast<double>(nq) : 0.0)
+      << "\n";
+  ofs << "avg_theta_switches_per_query="
+      << (nq ? static_cast<double>(sum_theta_switches) / static_cast<double>(nq) : 0.0)
       << "\n";
   if (!results.empty()) {
     ofs << "first_query_result_ids=";

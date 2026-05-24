@@ -160,6 +160,15 @@ def load_bvecs(path: str, max_vectors: int | None = None) -> List[List[float]]:
     return out
 
 
+_PROFILE_THETA: Dict[str, float] = {
+    "HOST_RESIDENT": 0.0,       # M0: 全内存，关闭 θ 切换
+    "HYBRID_FLOAT": 0.30,       # M1
+    "DISK_FIRST": 0.35,         # M2
+    "BVEC_DISK_TIERED": 0.35,   # M3
+    "BVEC_ULTRA_500G_100G": 0.35,  # M4
+}
+
+
 def _memory_profile_meta(path: str, ram_budget_gb: float = 100.0) -> Dict[str, Any]:
     sz = os.path.getsize(path) if os.path.isfile(path) else 0
     rho = sz / (ram_budget_gb * (1024**3)) if ram_budget_gb > 0 else 0.0
@@ -171,6 +180,7 @@ def _memory_profile_meta(path: str, ram_budget_gb: float = 100.0) -> Dict[str, A
         prof = "DISK_FIRST"
     return {
         "memory_profile": prof,
+        "partition_theta": _PROFILE_THETA.get(prof, 0.35),
         "data_bytes_gb": round(sz / (1024**3), 3),
         "ram_budget_gb": ram_budget_gb,
         "compression_ratio_rho": round(rho, 3),
@@ -336,8 +346,11 @@ def dump_extracted_features(
         print()
 
 
-def _policy_for_cluster(cluster: int, profile_name: str) -> Dict[str, Any]:
-    """策略簇 → JSON 字段（与 C++ merge_json_file 对齐）。"""
+def _policy_for_cluster(cluster: int, profile_name: str,
+                        partition_theta: float = 0.35) -> Dict[str, Any]:
+    """策略簇 → JSON 字段（与 C++ merge_json_file 对齐）。
+    partition_theta: GoVector θ 阶段切换比例（0=关闭，0.35 为 M2/M3/M4 默认）。
+    """
     if cluster == 0:
         return {
             "agent_profile": profile_name,
@@ -347,6 +360,7 @@ def _policy_for_cluster(cluster: int, profile_name: str) -> Dict[str, Any]:
             "use_layer_aware_prefetch": True,
             "sort_prefetch_by_disk_offset": True,
             "hot_insert_min_prior_misses": 2,
+            "partition_theta": partition_theta,
         }
     return {
         "agent_profile": profile_name,
@@ -356,6 +370,7 @@ def _policy_for_cluster(cluster: int, profile_name: str) -> Dict[str, Any]:
         "use_layer_aware_prefetch": False,
         "sort_prefetch_by_disk_offset": False,
         "hot_insert_min_prior_misses": 1,
+        "partition_theta": partition_theta,
     }
 
 
@@ -490,8 +505,10 @@ def main() -> None:
         labels = [0 if t.mean_fanout < med else 1 for t in traces]
         X = [_stats_to_features(t) for t in traces]
         tree_info = _maybe_print_tree(X, labels)
-        policy = _policy_for_cluster(cluster, args.profile)
-        policy.update(_memory_profile_meta(args.learn_fvecs))
+        mem_meta = _memory_profile_meta(args.learn_fvecs)
+        policy = _policy_for_cluster(cluster, args.profile,
+                                     partition_theta=mem_meta.get("partition_theta", 0.35))
+        policy.update(mem_meta)
         meta["tree_probe"] = tree_info
         meta["learn_fvecs"] = args.learn_fvecs
         meta["learn_vectors_loaded"] = len(vecs)

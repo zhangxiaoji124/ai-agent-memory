@@ -33,6 +33,11 @@ struct AgentIoPolicy {
   /// 2 近似「二次访问再缓存」，对应一次性访问排除的简化版。
   uint32_t hot_insert_min_prior_misses = 1;
 
+  /// GoVector θ 阶段切换比例（0 表示关闭）。
+  /// 当 layer0 搜索中 visited_count >= θ * ef_search 时进入探索期（phase2）。
+  /// M3/M4 默认 0.35，M0 关闭（0.0）。
+  float partition_theta = 0.0f;
+
   /// 与 `Config::prefetch_depth` 对齐的默认策略（不改变既有行为）。
   static AgentIoPolicy from_config(const Config &cfg);
 

@@ -4,6 +4,62 @@
 
 > 仓库地址：[zhangxiaoji124/ai-agent-memory](https://github.com/zhangxiaoji124/ai-agent-memory)
 
+## 实现进度摘要（2026-05）
+
+### 已完成功能
+
+| 模块 | 对应设计 | 要点 |
+|------|----------|------|
+| 磁盘 HNSW 检索（`search_disk`） | GoVector 核心路径 | `disk_search_layer` 多层贪心导航 + layer0 beam search |
+| **GoVector θ 阶段切换** | R5 / GoVector 动静混合 | `visited_count ≥ θ·ef_search` 触发 phase2，提高预取扇出；`theta_phase_switches` 可观测 |
+| GraphAwareCache 双池（Static + Dynamic LRU） | R4 | pinned 静态导航子图 + hot LRU 动态缓存 |
+| 静态子图 pin（启动时 BFS 导航层） | R4 | `pin_static_navigation_subgraph`，M4 下最激进 |
+| io_uring 异步预取（Linux） | 读优化（二） | `IoUringBackend` + `TopologyPrefetcher`；非 Linux 自动 noop |
+| **io_uring slot 循环复用修复** | — | 修复 user_data 编码错误；`drain_completions_nonblocking` 正确释放 slot |
+| 内存划分区分器 M0–M4 | R2/R3 | 根据文件类型 + `data_bytes/ram_budget` 自动选择；三区切分 MemTable 10% / Static 20% / Dynamic 70% |
+| bvec mmap + `VectorDataset` 统一抽象 | R1 | 支持 fvecs/bvecs 任意 dim；无需整文件载入 RAM |
+| 高维向量 v2 外置区（dim > 128） | R6 | 960 维等高维向量存放索引尾部，NodeBlock 仅存图结构 |
+| `partition_theta` 策略字段 | R5/R11 | JSON 解析 + 各 profile 默认值（M3/M4 = 0.35，M0 = 0.0） |
+| 离线策略学习（`train_agent_policy.py`） | R11 | sklearn 聚类 → `agent_io_policy.json`；含 memory_profile、partition_theta |
+| `eval_disk` 评测工具 | R12 | QPS / P50/P95/P99 / Recall@k；逐查询 CSV；`theta_phase_switches` 列 |
+| DiskANN RobustPrune HNSW 构图 | — | `build_index` 流式分批构图，支持 bvec + dim > 128 |
+| WAL + MemTable + CompactionWorker | 写优化骨架 | 实时插入缓冲；WAL 顺序刷盘 |
+| **PAIC 预取有效性追踪** | R8 简化 | `useful_prefetch_demand_hits` / `wasted_prefetch_evictions`；`prefetch_utilization_rate` 写入汇总 |
+| **BFS 图重排** | R9 简化 | `reorder_index` BFS 重排节点顺序；`compare-reorder` 一键量化 I/O 局部性改善 |
+| Linux 一键测试脚本 | R12 | `scripts/linux_run.sh all/compare/eval-quick/reorder/compare-reorder` |
+
+### 最近完善（本轮）
+
+**GoVector θ 阶段切换（上轮）：**
+- 在 `disk_search_layer` 实现 `visited_count ≥ θ·ef` 触发 `phase2=true`，layer0 搜索中自动切换预取扇出；上层贪心导航不启用 θ。
+- io_uring slot 泄漏修复：`user_data` 改为直接存 `slot_idx`；`drain_completions_nonblocking` 每次 `on_visit_node` 前执行。
+- `AgentIoPolicy::partition_theta`：JSON 解析 + 各内存 profile 默认值（M3/M4 = 0.35）。
+
+**PAIC 预取有效性追踪（本轮）：**
+- `GraphAwareCache` 新增 `record_prefetch_submitted(ids)` + `HotEntry.is_prefetch_loaded` 标志。
+- `TopologyPrefetcher` 在每次 `submit_prefetch` 后通知缓存（`set_cache` 接口）。
+- 命中已标记条目 → `io_metrics_.useful_prefetch_demand_hits++`（有效预取）。
+- 淘汰仍标记条目 → `io_metrics_.wasted_prefetch_evictions++`（无效预取）。
+- `eval_disk` CSV 新增 `useful_prefetch_demand_hits` / `wasted_prefetch_evictions`；汇总日志新增 `prefetch_utilization_rate`。
+
+**BFS 图重排（本轮）：**
+- `include/runtime/graph_reorder.h` + `src/runtime/graph_reorder.cpp`：从入口节点 BFS，将拓扑邻近节点赋予相近物理 id，layer0 邻居在磁盘上趋向连续。
+- 支持 v1（内联向量）与 v2（外置向量区）；输出同格式索引可直接替换使用。
+- `tools/reorder_index.cpp`：独立 CLI，打印重排前后 `avg_layer0_neighbor_id_dist` 局部性指标。
+- `scripts/linux_run.sh reorder` + `compare-reorder`：一键重排 + 对比评测。
+
+### 待后续实现（设计文档对应优先级）
+
+| 优先级 | 内容 | 对应设计节 |
+|--------|------|-----------|
+| ~~P1~~ 已完成 | ~~PAIC~~ demand/prefetch 计数（useful_hits / wasted_evictions）已落地；KV Group 粒度缓存与 ISVM 替换策略仍为研究级 | § 读优化（一）R8 |
+| ~~P1~~ 已完成 | ~~图重排（BFS 简化版）~~已落地（`reorder_index`）；Gorder/Porder 权重重排为研究级 | § 读优化（二）R9 |
+| P2 | RemapCom 零拷贝合并 / NobLSM 非阻塞提交 / NVTable | § 写优化 R10 |
+| P2 | LangChain / LlamaIndex Python VectorStore 封装 | § 透明集成 |
+| — | 全量 500 GB bvec 端到端评测 + `--ram-budget-gb 100` 口径文档 | R7/R12 |
+
+---
+
 ## 目录结构
 
 ```
@@ -51,6 +107,7 @@ chmod +x scripts/linux_run.sh
 | 学习策略 | `./scripts/linux_run.sh policy` | 生成 `data/agent_io_policy.json`（fvecs/bvecs learn） |
 | 编译 | `./scripts/linux_run.sh build` | 产物在 `build/` |
 | 建索引 | `./scripts/linux_run.sh build-index` | 默认 SIFT fvecs；支持 bvec、dim>128 流式 |
+| 图重排 | `./scripts/linux_run.sh reorder` | BFS 重排索引节点顺序，改善 layer0 空间局部性 |
 | 单测 | `./scripts/linux_run.sh test` | 含 memory_partition、960 维索引测试 |
 | 基准 | `./scripts/linux_run.sh bench` | `bench_search` + `bench_write` |
 
@@ -96,6 +153,9 @@ chmod +x scripts/linux_run.sh
 | `disk_via_uring` / `disk_via_pread` | 读路径分布 |
 | `prefetch_blocks_submitted` | 预取提交块数 |
 | `cache_hits` / `cache_misses` | 图缓存命中/未命中 |
+| `theta_phase_switches` | 该查询中 θ 阶段切换次数（0 = 未触发，1 = 已切换至探索期） |
+| `useful_prefetch_demand_hits` | 预取协同加载的缓存条目被后续需求命中次数（有效预取） |
+| `wasted_prefetch_evictions` | 预取加载的缓存条目在需求到来前被驱逐次数（无效预取） |
 
 关闭逐查询 CSV：`--metrics-log none`
 

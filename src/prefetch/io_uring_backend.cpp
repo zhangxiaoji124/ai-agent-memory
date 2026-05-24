@@ -125,9 +125,7 @@ bool IoUringBackend::submit_prefetch(const std::vector<uint64_t> &node_ids) {
     }
     io_uring_prep_read(sqe, impl_->fd, slot.buf,
                        static_cast<unsigned>(amio::index::kBlockSize), off);
-    io_uring_sqe_set_data64(sqe,
-                            (static_cast<uint64_t>(slot_idx) << 32) ^
-                                static_cast<uint64_t>(id + 0x9e3779b97f4a7c15ULL));
+    io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(slot_idx));
     submitted++;
   }
   if (submitted > 0)
@@ -142,9 +140,12 @@ void IoUringBackend::drain_completions_nonblocking(int max_events) {
   io_uring_cqe *cqe = nullptr;
   while (got < max_events &&
          io_uring_peek_cqe(&impl_->ring, &cqe) == 0 && cqe != nullptr) {
+    const uint64_t ud = cqe->user_data;
     io_uring_cqe_seen(&impl_->ring, cqe);
-    (void)(cqe->res);
-    // 简化：不在此处解析 user_data；仅释放队列上的完成项。
+    // user_data 就是 slot_idx，释放 slot 以供后续预取复用
+    if (ud < impl_->slots.size()) {
+      impl_->slots[static_cast<size_t>(ud)].busy = false;
+    }
     got++;
   }
 }

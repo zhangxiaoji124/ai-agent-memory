@@ -36,6 +36,9 @@ uint64_t pick_closest(const std::vector<std::pair<uint64_t, float>> &w) {
 }
 
 /// 在磁盘上复现单层 best-first 搜索（与内存 HNSW 同构）。
+/// policy 非空时启用 θ 阶段切换：
+///   - 收敛期（visited < θ·ef）：使用标准预取深度
+///   - 探索期（visited ≥ θ·ef）：phase2=true，使用 layer0 扇出加速预取
 std::vector<std::pair<uint64_t, float>>
 disk_search_layer(index::IndexFile &file, cache::GraphAwareCache &cache,
                   prefetch::IoUringBackend *uring, prefetch::TopologyPrefetcher &prefetch,
@@ -43,7 +46,8 @@ disk_search_layer(index::IndexFile &file, cache::GraphAwareCache &cache,
                   const std::vector<float> &q, size_t ef, int layer, size_t dim,
                   uint64_t total_nodes,
                   float (*dist_block)(const std::vector<float> &, const index::NodeBlock &,
-                                      size_t)) {
+                                      size_t),
+                  const policy::AgentIoPolicy *pol, IoMetrics *io_metrics) {
   struct Item {
     float d;
     uint64_t id;
@@ -60,6 +64,15 @@ disk_search_layer(index::IndexFile &file, cache::GraphAwareCache &cache,
   if (ep >= total_nodes)
     ep = 0;
 
+  // θ 阶段切换参数（GoVector 动静混合核心）
+  const float theta = (pol && pol->partition_theta > 0.0f) ? pol->partition_theta : 0.0f;
+  const size_t theta_threshold = (theta > 0.0f && ef > 0)
+                                     ? static_cast<size_t>(theta * static_cast<float>(ef))
+                                     : 0;
+  bool phase2 = false;
+  bool phase2_logged = false;
+  size_t visited_count = 0;
+
   index::NodeBlock epb{};
   if (!cache.get_or_load(&file, uring, ep, &epb)) {
     if (ep != 0 && cache.get_or_load(&file, uring, 0, &epb))
@@ -67,15 +80,25 @@ disk_search_layer(index::IndexFile &file, cache::GraphAwareCache &cache,
     else
       return {};
   }
-  prefetch.on_visit_node(epb, static_cast<uint8_t>(layer));
+  prefetch.on_visit_node(epb, static_cast<uint8_t>(layer), phase2);
+  visited.insert(ep);
+  ++visited_count;
 
   const float d0 =
       (ext_vecs && ext_vecs->ok()) ? ext_vecs->l2_sq(q, ep) : dist_block(q, epb, dim);
   candidates.push(Item{d0, ep});
   topk.push(Item{d0, ep});
-  visited.insert(ep);
 
   while (!candidates.empty()) {
+    // θ 阶段检测：visited_count 超过阈值时切换到探索期
+    if (!phase2 && theta_threshold > 0 && visited_count >= theta_threshold) {
+      phase2 = true;
+      if (!phase2_logged && io_metrics) {
+        io_metrics->theta_phase_switches.fetch_add(1, std::memory_order_relaxed);
+        phase2_logged = true;
+      }
+    }
+
     const Item cur = candidates.top();
     candidates.pop();
     const float worst = topk.top().d;
@@ -85,7 +108,7 @@ disk_search_layer(index::IndexFile &file, cache::GraphAwareCache &cache,
     index::NodeBlock curb{};
     if (!cache.get_or_load(&file, uring, cur.id, &curb))
       continue;
-    prefetch.on_visit_node(curb, static_cast<uint8_t>(layer));
+    prefetch.on_visit_node(curb, static_cast<uint8_t>(layer), phase2);
     const uint8_t cnt = curb.neighbor_counts[layer];
     const size_t n = cnt > 32 ? 32 : cnt;
     for (size_t j = 0; j < n; j++) {
@@ -93,6 +116,7 @@ disk_search_layer(index::IndexFile &file, cache::GraphAwareCache &cache,
       if (nb >= total_nodes)
         continue;
       if (visited.insert(nb).second) {
+        ++visited_count;
         index::NodeBlock nbk{};
         if (!cache.get_or_load(&file, uring, nb, &nbk))
           continue;
@@ -131,7 +155,10 @@ VectorStore::VectorStore(const Config &cfg)
                  1024ull * 1024ull,
              &io_policy_, &io_metrics_),
       prefetch_(cfg.prefetch_depth, &io_policy_, &io_metrics_),
-      memtable_(cfg.memtable_limit_mb * 1024ull * 1024ull) {}
+      memtable_(cfg.memtable_limit_mb * 1024ull * 1024ull) {
+  // PAIC: 连接预取器与缓存，使预取提交记录可观测
+  prefetch_.set_cache(&cache_);
+}
 
 VectorStore::~VectorStore() = default;
 
@@ -299,16 +326,20 @@ std::vector<SearchResult> VectorStore::search_disk(const std::vector<float> &que
   if (ep >= total_nodes)
     ep = 0;
   const int ml = std::min(7, static_cast<int>(header_.max_layer));
+  // 高层贪心导航：不启用 θ（不在 layer0，每层只取 1 个最近点）
   for (int lc = ml; lc > 0; lc--) {
     auto w = disk_search_layer(file_, cache_, uring_.get(), prefetch_, ext_vecs_.get(), ep,
-                               query, 1, lc, dim, total_nodes, &VectorStore::l2_sq_block);
+                               query, 1, lc, dim, total_nodes, &VectorStore::l2_sq_block,
+                               nullptr, nullptr);
     if (!w.empty())
       ep = pick_closest(w);
   }
 
+  // layer0 beam search：启用 θ 阶段切换（GoVector 动静混合核心路径）
   auto w0 =
       disk_search_layer(file_, cache_, uring_.get(), prefetch_, ext_vecs_.get(), ep, query,
-                      cfg_.ef_search, 0, dim, total_nodes, &VectorStore::l2_sq_block);
+                        cfg_.ef_search, 0, dim, total_nodes, &VectorStore::l2_sq_block,
+                        &io_policy_, &io_metrics_);
   std::sort(w0.begin(), w0.end(),
             [](const auto &a, const auto &b) { return a.second < b.second; });
   if (w0.size() > k)

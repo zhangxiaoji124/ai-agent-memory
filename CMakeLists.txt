@@ -27,6 +27,7 @@ add_library(amio
   src/index/external_vectors.cpp
   src/runtime/memory_partition.cpp
   src/runtime/static_subgraph.cpp
+  src/runtime/graph_reorder.cpp
   src/vector_store.cpp
         include/cache/graph_aware_cache.h
         include/util/io_metrics.h
@@ -73,8 +74,30 @@ target_link_libraries(build_index PRIVATE amio)
 add_executable(eval_disk tools/eval_disk.cpp)
 target_link_libraries(eval_disk PRIVATE amio)
 
+add_executable(reorder_index tools/reorder_index.cpp)
+target_link_libraries(reorder_index PRIVATE amio)
+
 add_executable(bench_search benches/bench_search.cpp)
 target_link_libraries(bench_search PRIVATE amio)
 
 add_executable(bench_write benches/bench_write.cpp)
 target_link_libraries(bench_write PRIVATE amio)
+
+# ── Python ctypes bridge ───────────────────────────────────────────────────
+option(AMIO_BUILD_PYTHON "Build amio_py shared library for Python bindings" OFF)
+if(AMIO_BUILD_PYTHON)
+  add_library(amio_py SHARED src/python_bridge.cpp)
+  target_link_libraries(amio_py PRIVATE amio)
+  target_include_directories(amio_py PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  set_target_properties(amio_py PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+  )
+  if(WIN32)
+    # Windows: DLL goes to build root so Python can find it easily
+    set_target_properties(amio_py PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    )
+  endif()
+  message(STATUS "amio_py: Python ctypes bridge enabled")
+endif()

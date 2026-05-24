@@ -12,6 +12,9 @@ class IoBackend {
 public:
   virtual ~IoBackend() = default;
   virtual bool submit_prefetch(const std::vector<uint64_t> &node_ids) = 0;
+  // 非阻塞收割已完成的 io_uring CQE，释放 slot 供后续预取复用。
+  // 非 io_uring 后端默认为空操作。
+  virtual void drain_completions_nonblocking(int max_events = 32) { (void)max_events; }
 };
 
 class NoopBackend final : public IoBackend {

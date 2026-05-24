@@ -4,8 +4,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include "index/storage_layout.h"
 #include "policy/agent_io_policy.h"
@@ -20,7 +23,17 @@ class IoUringBackend;
 
 namespace amio::cache {
 
-/// 图感知缓存（骨架）：pinned 常驻 + hot LRU（后续可替换 LFU）。
+/// 图感知缓存：pinned 常驻 + hot LRU + PAIC 预取有效性追踪（简化版）。
+///
+/// PAIC 追踪：
+///  - TopologyPrefetcher 提交预取时调用 record_prefetch_submitted()，
+///    将这批 id 写入 prefetch_pending_ 集合。
+///  - get_or_load() 缓存未命中从磁盘加载时，若 id 在 prefetch_pending_ 中
+///    则标记 HotEntry.is_prefetch_loaded=true（预取与需求协同）。
+///  - get() 命中已标记条目时，计入 io_metrics_->useful_prefetch_demand_hits
+///    并清除标记（需求已消费该预取）。
+///  - evict_if_needed_locked() 淘汰仍标记条目时，计入
+///    io_metrics_->wasted_prefetch_evictions（条目在需求到来前被逐出）。
 class GraphAwareCache {
 public:
   /// @param dynamic_capacity_bytes  Dynamic/hot LRU 池上限
@@ -30,7 +43,6 @@ public:
                            const policy::AgentIoPolicy *policy = nullptr,
                            ::amio::IoMetrics *io_metrics = nullptr);
 
-  // 不可拷贝
   GraphAwareCache(const GraphAwareCache &) = delete;
   GraphAwareCache &operator=(const GraphAwareCache &) = delete;
 
@@ -53,12 +65,8 @@ public:
 
   double hit_rate() const;
 
-  uint64_t hits_total() const {
-    return hits_.load(std::memory_order_relaxed);
-  }
-  uint64_t misses_total() const {
-    return misses_.load(std::memory_order_relaxed);
-  }
+  uint64_t hits_total() const { return hits_.load(std::memory_order_relaxed); }
+  uint64_t misses_total() const { return misses_.load(std::memory_order_relaxed); }
 
   uint64_t pinned_bytes_used() const;
   uint64_t static_pins_count() const { return static_pins_count_; }
@@ -66,7 +74,13 @@ public:
   /// 将命中/未命中计数清零（保留缓存内容），用于按查询粒度统计。
   void reset_access_counters();
 
+  /// PAIC：记录预取提交的节点 id，供后续需求命中时统计有效性。
+  /// 集合上限 kMaxPrefetchPending，超出时清空以防无界增长。
+  void record_prefetch_submitted(const std::vector<uint64_t> &ids);
+
 private:
+  static constexpr size_t kMaxPrefetchPending = 32768;
+
   size_t dynamic_capacity_bytes_ = 0;
   size_t pinned_capacity_bytes_ = 0;
   size_t hot_used_bytes_ = 0;
@@ -76,10 +90,10 @@ private:
   mutable std::shared_mutex mu_;
   std::unordered_map<uint64_t, amio::index::NodeBlock> pinned_;
 
-  // 简易 LRU：使用 `tick` + 最小 tick 淘汰（骨架实现，O(n)）。
   struct HotEntry {
     amio::index::NodeBlock block{};
     uint64_t tick = 0;
+    bool is_prefetch_loaded = false; // PAIC: 该条目由预取协同触发加载
   };
   std::unordered_map<uint64_t, HotEntry> hot_;
   uint64_t tick_ = 0;
@@ -87,8 +101,14 @@ private:
   std::atomic<uint64_t> hits_{0};
   std::atomic<uint64_t> misses_{0};
 
+  // PAIC 预取 pending 集合，独立锁以减少与主缓存锁的竞争
+  std::mutex prefetch_pending_mu_;
+  std::unordered_set<uint64_t> prefetch_pending_;
+
   void evict_if_needed_locked();
-  void insert_hot_locked(uint64_t node_id, const amio::index::NodeBlock &b);
+  void insert_hot_locked(uint64_t node_id, const amio::index::NodeBlock &b,
+                         bool is_prefetch_loaded = false);
+  bool consume_prefetch_pending(uint64_t id);
 
   const policy::AgentIoPolicy *policy_ = nullptr;
   ::amio::IoMetrics *io_metrics_ = nullptr;

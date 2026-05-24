@@ -165,6 +165,37 @@ uint64_t file_size_bytes(const std::string &path) {
   return static_cast<uint64_t>(ifs.tellg());
 }
 
+VectorFileKind detect_kind_by_content(const std::string &path) {
+  std::ifstream ifs(path, std::ios::binary);
+  if (!ifs)
+    return VectorFileKind::Unknown;
+  uint32_t dim = 0;
+  if (!ifs.read(reinterpret_cast<char *>(&dim), 4))
+    return VectorFileKind::Unknown;
+  if (dim == 0 || dim > 65535)
+    return VectorFileKind::Unknown;
+  const uint64_t fsize = file_size_bytes(path);
+  if (fsize == 0)
+    return VectorFileKind::Unknown;
+  const uint64_t fvec_rec = 4ull + dim * 4ull;
+  const uint64_t bvec_rec = 4ull + dim;
+  // When both divide evenly, prefer bvecs only for large dim (≥32) to avoid ambiguity
+  if (bvec_rec > 0 && fsize % bvec_rec == 0 && dim >= 32)
+    return VectorFileKind::Bvecs;
+  if (fvec_rec > 0 && fsize % fvec_rec == 0)
+    return VectorFileKind::Fvecs;
+  if (bvec_rec > 0 && fsize % bvec_rec == 0)
+    return VectorFileKind::Bvecs;
+  return VectorFileKind::Unknown;
+}
+
+VectorFileKind detect_vector_file_kind(const std::string &path) {
+  const VectorFileKind k = detect_kind_by_extension(path);
+  if (k != VectorFileKind::Unknown)
+    return k;
+  return detect_kind_by_content(path);
+}
+
 bool probe_vector_file(const std::string &path, VectorFileKind kind, uint32_t *dim_out,
                        uint64_t *num_vectors_est_out) {
   if (!dim_out || !num_vectors_est_out) {

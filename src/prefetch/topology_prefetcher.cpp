@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/graph_aware_cache.h"
 #include "util/macros.h"
 
 namespace amio::prefetch {
@@ -21,9 +22,12 @@ bool TopologyPrefetcher::use_legacy_prefetch(const policy::AgentIoPolicy &p) {
 }
 
 void TopologyPrefetcher::on_visit_node(const amio::index::NodeBlock &node,
-                                         uint8_t layer) {
+                                       uint8_t layer, bool phase2) {
   if (!io_)
     return;
+
+  // 每次提交前先非阻塞收割已完成 CQE，释放 slot 供后续复用，避免 slot 耗尽导致预取静默失效。
+  io_->drain_completions_nonblocking(32);
 
   const policy::AgentIoPolicy &pol =
       policy_ ? *policy_ : policy::AgentIoPolicy{};
@@ -47,6 +51,8 @@ void TopologyPrefetcher::on_visit_node(const amio::index::NodeBlock &node,
       io_metrics_->prefetch_blocks_submitted.fetch_add(ids.size(),
                                                        std::memory_order_relaxed);
     (void)io_->submit_prefetch(ids);
+    if (cache_)
+      cache_->record_prefetch_submitted(ids);
     return;
   }
 
@@ -69,16 +75,20 @@ void TopologyPrefetcher::on_visit_node(const amio::index::NodeBlock &node,
       io_metrics_->prefetch_blocks_submitted.fetch_add(ids.size(),
                                                        std::memory_order_relaxed);
     (void)io_->submit_prefetch(ids);
+    if (cache_)
+      cache_->record_prefetch_submitted(ids);
     return;
   }
 
-  const size_t d =
-      layer == 0 ? pol.prefetch_depth_layer0 : pol.prefetch_depth_upper;
+  // phase2（θ 触发后的细粒度探索期）：强制使用 layer0 的扇出上限，增大预取覆盖面
+  const size_t d = (phase2 || layer == 0) ? pol.prefetch_depth_layer0
+                                           : pol.prefetch_depth_upper;
   if (d == 0)
     return;
 
-  const size_t max_fan =
-      layer == 0 ? std::min<size_t>(32, pol.max_neighbor_fanout_layer0) : 32u;
+  const size_t max_fan = (phase2 || layer == 0)
+                             ? std::min<size_t>(32, pol.max_neighbor_fanout_layer0)
+                             : 32u;
   std::vector<std::pair<uint64_t, uint64_t>> tagged;
   tagged.reserve(256);
 
@@ -118,6 +128,8 @@ void TopologyPrefetcher::on_visit_node(const amio::index::NodeBlock &node,
     io_metrics_->prefetch_blocks_submitted.fetch_add(ids.size(),
                                                      std::memory_order_relaxed);
   (void)io_->submit_prefetch(ids);
+  if (cache_)
+    cache_->record_prefetch_submitted(ids);
 }
 
 } // namespace amio::prefetch
