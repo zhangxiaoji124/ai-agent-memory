@@ -15,6 +15,15 @@ static uint32_t estimate_kv_group_bytes(const amio::index::NodeBlock &b) {
   return static_cast<uint32_t>(cnt) * static_cast<uint32_t>(sizeof(uint32_t));
 }
 
+int64_t GraphAwareCache::ev_key_for(bool is_prefetch_loaded, uint32_t kv_group_bytes,
+                                    uint64_t tick) const {
+  // C = ISVM 评分中与时间无关的分量（tick_age=0 时即为该分量）。
+  // 真实驱逐分 score = tick_age/16 + C；驱逐时 tick_ 对所有条目相同，
+  // 故 argmax(score) ≡ argmax(16*C - tick)（floor 引入 ≤1 桶误差，对启发式可忽略）。
+  const int32_t c = isvm_.eviction_score(is_prefetch_loaded, /*tick_age=*/0, kv_group_bytes);
+  return static_cast<int64_t>(c) * 16 - static_cast<int64_t>(tick);
+}
+
 GraphAwareCache::GraphAwareCache(size_t dynamic_capacity_bytes, size_t pinned_capacity_bytes,
                                  const policy::AgentIoPolicy *policy,
                                  ::amio::IoMetrics *io_metrics)
@@ -52,6 +61,8 @@ bool GraphAwareCache::get(uint64_t node_id, amio::index::NodeBlock *out) {
   }
   auto ith = hot_.find(node_id);
   if (ith != hot_.end()) {
+    // 命中改变 tick（以及可能清除预取标志）→ 驱逐键变化，需同步更新 ev_index_。
+    ev_index_.erase({ith->second.ev_key, node_id});
     ith->second.tick = ++tick_;
     // PAIC: 需求命中预取协同加载的条目 → 有效预取
     if (ith->second.is_prefetch_loaded) {
@@ -59,6 +70,9 @@ bool GraphAwareCache::get(uint64_t node_id, amio::index::NodeBlock *out) {
       if (io_metrics_)
         io_metrics_->useful_prefetch_demand_hits.fetch_add(1, std::memory_order_relaxed);
     }
+    ith->second.ev_key = ev_key_for(ith->second.is_prefetch_loaded,
+                                    ith->second.kv_group_bytes, ith->second.tick);
+    ev_index_.insert({ith->second.ev_key, node_id});
     *out = ith->second.block;
     hits_.fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -150,15 +164,21 @@ void GraphAwareCache::insert_hot(uint64_t node_id, const amio::index::NodeBlock 
 
 void GraphAwareCache::insert_hot_locked(uint64_t node_id, const amio::index::NodeBlock &b,
                                         bool is_prefetch_loaded) {
+  auto existing = hot_.find(node_id);
+  if (existing != hot_.end()) {
+    // 覆盖已有条目：先摘掉旧的驱逐索引项。
+    ev_index_.erase({existing->second.ev_key, node_id});
+  } else {
+    hot_used_bytes_ += amio::index::kBlockSize;
+  }
   HotEntry e;
   e.block = b;
   e.tick = ++tick_;
   e.is_prefetch_loaded = is_prefetch_loaded;
   e.kv_group_bytes = estimate_kv_group_bytes(b);
-  if (hot_.find(node_id) == hot_.end()) {
-    hot_used_bytes_ += amio::index::kBlockSize;
-  }
+  e.ev_key = ev_key_for(e.is_prefetch_loaded, e.kv_group_bytes, e.tick);
   hot_[node_id] = e;
+  ev_index_.insert({e.ev_key, node_id});
   evict_if_needed_locked();
 }
 
@@ -170,27 +190,20 @@ void GraphAwareCache::set_isvm_kv_cache_enabled(bool enabled) {
 void GraphAwareCache::evict_if_needed_locked() {
   if (dynamic_capacity_bytes_ == 0)
     return;
-  while (hot_used_bytes_ > dynamic_capacity_bytes_ && !hot_.empty()) {
-    uint64_t victim = 0;
-    int32_t best_score = std::numeric_limits<int32_t>::min();
-    uint64_t oldest_tick = std::numeric_limits<uint64_t>::max();
-    for (const auto &kv : hot_) {
-      const uint64_t age = tick_ - kv.second.tick;
-      const int32_t score =
-          isvm_.eviction_score(kv.second.is_prefetch_loaded, age, kv.second.kv_group_bytes);
-      if (score > best_score || (score == best_score && kv.second.tick < oldest_tick)) {
-        best_score = score;
-        oldest_tick = kv.second.tick;
-        victim = kv.first;
-      }
-    }
+  // O(log n) 驱逐：ev_index_ 中 ev_key 最大者（rbegin）即 ISVM 评分最高、最该淘汰的条目。
+  while (hot_used_bytes_ > dynamic_capacity_bytes_ && !ev_index_.empty()) {
+    auto worst = std::prev(ev_index_.end());
+    const uint64_t victim = worst->second;
     auto it = hot_.find(victim);
     // PAIC: 驱逐仍标记为预取加载的条目 → 无效预取
     if (it != hot_.end() && it->second.is_prefetch_loaded && io_metrics_) {
       io_metrics_->wasted_prefetch_evictions.fetch_add(1, std::memory_order_relaxed);
     }
-    hot_.erase(victim);
-    hot_used_bytes_ -= amio::index::kBlockSize;
+    ev_index_.erase(worst);
+    if (it != hot_.end()) {
+      hot_.erase(it);
+      hot_used_bytes_ -= amio::index::kBlockSize;
+    }
   }
 }
 

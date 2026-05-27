@@ -5,9 +5,11 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "index/storage_layout.h"
@@ -99,9 +101,17 @@ private:
     uint64_t tick = 0;
     bool is_prefetch_loaded = false; // PAIC: 该条目由预取协同触发加载
     uint32_t kv_group_bytes = 0;     // GroupCache: layer0 邻居组字节估算
+    int64_t ev_key = 0;              // 在 ev_index_ 中的稳定驱逐键（16*C - tick）
   };
   std::unordered_map<uint64_t, HotEntry> hot_;
+  // 驱逐索引：(ev_key, node_id) 升序；ev_key 最大者最该被驱逐（rbegin）。
+  // 把 O(n) 全表扫描换成 O(log n)，同时保持 ISVM 评分的 argmax 顺序不变。
+  std::set<std::pair<int64_t, uint64_t>> ev_index_;
   uint64_t tick_ = 0;
+
+  /// 计算与时间无关的 ISVM 分量 C，并组合成稳定驱逐键 16*C - tick。
+  /// 驱逐时 tick_ 对所有条目相同，故 argmax(score) ≡ argmax(16*C - tick)。
+  int64_t ev_key_for(bool is_prefetch_loaded, uint32_t kv_group_bytes, uint64_t tick) const;
 
   std::atomic<uint64_t> hits_{0};
   std::atomic<uint64_t> misses_{0};
