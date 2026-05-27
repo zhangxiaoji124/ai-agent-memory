@@ -22,7 +22,8 @@
 | `partition_theta` 策略字段 | R5/R11 | JSON 解析 + 各 profile 默认值（M3/M4 = 0.35，M0 = 0.0） |
 | 离线策略学习（`train_agent_policy.py`） | R11 | sklearn 聚类 → `agent_io_policy.json`；含 memory_profile、partition_theta |
 | `eval_disk` 评测工具 | R12 | QPS / P50/P95/P99 / Recall@k；逐查询 CSV；`theta_phase_switches` 列 |
-| DiskANN RobustPrune HNSW 构图 | — | `build_index` 流式分批构图，支持 bvec + dim > 128 |
+| DiskANN RobustPrune HNSW 构图 | — | `build_index` 流式分批构图，支持 bvec + dim > 128；遮挡不等式已修正（见下方本轮） |
+| **SIMD 距离（AVX2/FMA 运行时派发）** | — | `util/simd_distance.h` 统一 L2 平方距离；GIST 960 维端到端 **2.31×**，召回不变 |
 | WAL + MemTable + CompactionWorker | 写优化 | NVTable 链表缓冲、NobLSM 异步提交、RemapCom UDB、**增量写回 `.index`** |
 | **KV Group + ISVM 缓存驱逐** | R8 简化 | layer0 邻居组字节估算 + 整数线性 ISVM 驱逐分 |
 | **PAIC 预取有效性追踪** | R8 简化 | `useful_prefetch_demand_hits` / `wasted_prefetch_evictions`；`prefetch_utilization_rate` 写入汇总 |
@@ -48,6 +49,18 @@
 - 支持 v1（内联向量）与 v2（外置向量区）；输出同格式索引可直接替换使用。
 - `tools/reorder_index.cpp`：独立 CLI，打印重排前后 `avg_layer0_neighbor_id_dist` 局部性指标。
 - `scripts/linux_run.sh reorder` + `compare-reorder`：一键重排 + 对比评测。
+
+**2026-05-27 实测修复与优化（关键）：**
+- **修复召回崩塌 bug**：`HnswIndex::robust_prune` 的 DiskANN 遮挡不等式写反（alpha 放错边），导致每节点被过度剪枝到约 1 个邻居。修正后召回大幅恢复（Linux 实机 `--recompute-gt 1` 口径）：
+  - SIFT 100K @ ef=192：recall@10 **0.12 → 1.000**
+  - GIST 10K（960 维）@ ef=192：recall@10 **0.007 → 0.999**
+- **SIMD 距离（AVX2 + FMA，运行时派发）**：新增 `include/util/simd_distance.h` 统一 L2 平方距离，`HnswIndex` / `ExternalVectorStore` / `VectorStore` 三处接入；无 AVX2 时标量自动兜底，`AMIO_FORCE_SCALAR=1` 可强制标量做 A/B。端到端（建图+GT+检索）实测：
+  - GIST 10K（960 维）：**2.31×**（288.6s → 124.8s）
+  - SIFT 100K（128 维）：**1.43×**（855.5s → 597.7s）
+- **建图加速**：`add_edge` 邻居表未满时直接追加，仅在超过容量上限时才重跑 RobustPrune（hnswlib/DiskANN 同款），避免每条边 O(cap²) 重剪枝。
+- **`eval_disk` 受限内存评测**：新增 `--cache-size-mb` / `--static-cache-mb`，可将动态缓存压到远小于索引大小，制造真实缓存未命中以评测预取/缓存（对齐 10–20% 内存场景）。
+- **修复 `eval_disk --recompute-gt 1`**：此前 `nq` 取 `gt_all.size()`（重算 GT 时为 0）导致评测 0 条 query。
+- 详见 `docs/提升方案-基于实测结果.md` 与 `docs/Agent长时记忆-实现状态对照.md`（已同步修订）。
 
 ### 待后续实现（设计文档对应优先级）
 

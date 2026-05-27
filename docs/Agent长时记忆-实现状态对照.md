@@ -2,7 +2,11 @@
 
 > 对应设计原文：`Agent 长时记忆存储引擎设计(1).md`（赛题目标架构论述）  
 > 本文档说明**哪些内容已在 `agent-memory-io-cpp` 仓库落地、哪些仍为设计愿景**，并给出后续完善优先级。  
-> 关联文档：`docs/赛题剩余工作与交付计划.md`、`papers-algorithm-summary.md`、`README.md`
+> 关联文档：`docs/赛题剩余工作与交付计划.md`、`papers-algorithm-summary.md`、`README.md`、`docs/提升方案-基于实测结果.md`
+
+---
+
+> **⚠️ 2026-05-27 实测修订**：本轮在 Linux 实机核对代码后，多处状态由「未实现」上调为「部分 / 简化 / 模拟」（θ、Group Cache、LRU-S、PAIC、图重排、NVTable、RemapCom、NobLSM 实际已有骨架代码）。同时**修复了一个导致召回崩塌的 bug**（`HnswIndex::robust_prune` 遮挡不等式写反），召回从 SIFT 0.12 / GIST 0.007 恢复到 **1.0 / 0.999**，已达设计 85% 基线（满内存口径，受限内存待复测）。下表已据此更新。改进优先级见 `docs/提升方案-基于实测结果.md`。
 
 ---
 
@@ -46,10 +50,10 @@
 | 内存 10% MemTable / 20% Static / 70% Dynamic 三区 | **未** | 读侧无按比例硬切；写侧仅有 MemTable 概念 |
 | GoVector 静态缓存（入口+高层邻居） | **部分** | `GraphAwareCache::pin()` 可锚定节点；无自动提取高层子图 |
 | GoVector 动态缓存（路径+相似邻居页） | **未** | 无环形区域观测、无相似页批量加载 |
-| 阶段切换参数 θ（收敛期→探索期） | **未** | 检索统一 `get_or_load`，无在线 θ |
-| Group Cache（KV Group + 范围不对称性） | **未** | 非 LSM 多层 KV；缓存单元为整页 `NodeBlock`（4KB） |
-| LRU-S 大小感知淘汰 | **未** | hot 区为 tick + 全表扫描淘汰（O(n) 骨架） |
-| PAIC（ISVM 双预测器、Demand-MIN、PCHR） | **未** | 无 demand/prefetch 分流、无 ISVM |
+| 阶段切换参数 θ（收敛期→探索期） | **部分** | `partition_theta`+`phase2` 已实现（`vector_store.cpp` `disk_search_layer`）；基础版，无在线学习 θ |
+| Group Cache（KV Group + 范围不对称性） | **名义** | 仅追踪 `kv_group_bytes` 喂给驱逐评分；缓存单元仍是整页 `NodeBlock`（4KB），非真正 KV Group |
+| LRU-S 大小感知淘汰 | **简化** | `IsvmScorer::eviction_score` 含 size 项，但驱逐是共享锁下 O(n) 全表扫描，无分片 |
+| PAIC（ISVM 双预测器、Demand-MIN、PCHR） | **简化启发式** | 有 useful/wasted 预取计数 + 固定权重整数评分；无双预测器 / PCHR / 训练 |
 | 一次性访问排除 | **部分** | `hot_insert_min_prior_misses`：第 N 次冷未命中才入 hot |
 
 ### 3.2 已实现代码路径
@@ -64,7 +68,7 @@
 
 | 设计要点 | 状态 | 说明 |
 |----------|------|------|
-| Gorder / Corder / Porder 图重排 | **未** | `NodeBlock` 按 `node_id` 线性偏移落盘（`storage_layout.h`） |
+| Gorder / Corder / Porder 图重排 | **部分** | BFS + Gorder 已实现（`runtime/graph_reorder.*`），但仅离线工具 `tools/reorder_index.cpp`，未接 build/compaction；无 Porder |
 | Episode + Baleen ML 预取/准入 | **未** | 无 Episode 统计与模型 |
 | io_uring 环形队列批量预取 | **已实现**（Linux） | `AMIO_ENABLE_URING=ON`；非 Linux 为 stub |
 | ML-Range / ML-When + 负载 tanh 门控 | **未（在线）** | 由离线 JSON 静态参数近似 |
@@ -88,9 +92,9 @@
 | MemTable 吸收写入 | **部分** | `write/memtable.*` |
 | WAL | **部分** | `write/wal.*`（**仍保留 WAL**，非 NVTable 无 WAL） |
 | 多层 SST + 后台 Compaction | **部分** | `CompactionWorker` 队列 + 回调，无完整 LSM 层级 |
-| NVTable / List Compaction | **未** | 无 NVM 链表、无指针合并 |
-| RemapCom（UDB + SSD remap） | **未** | 无 UDB 状态机、无 remap ioctl |
-| NobLSM（check_commit / is_committed） | **未** | 无免 fsync 内核协同 |
+| NVTable / List Compaction | **简化** | `write/nvtable.*` 为 DRAM `vector` 链；无 NVM / offset 数组；WAL 仍在跑（未达 WAL-free） |
+| RemapCom（UDB + SSD remap） | **模拟** | `write/remap_com.*` 分 Changed/Unchanged + 记 remap 表；无真实 `nvme_ioctl` / FTL |
+| NobLSM（check_commit / is_committed） | **模拟** | `write/noblsm_commit.*` 为用户态 grace 计时器；无内核 syscall / Ext4 协同 |
 
 > **评测说明**：当前赛题主评测路径为磁盘**读**（`tools/eval_disk`）；写路径对检索尾延迟的影响尚未在统一脚本中量化。
 
@@ -153,7 +157,7 @@
 | LangChain / LlamaIndex VectorStore | **未** |
 | Session ID / 时间戳边过滤 | **未** |
 | 统一 QPS / P99 / Recall@10 脚本 | **部分**（`eval_disk`、`linux_run.sh compare`） |
-| Recall@10 ≥ 85%（10–20% 内存） | **待 Linux 全量固化** |
+| Recall@10 ≥ 85%（10–20% 内存） | **满内存已达标**（修复后 SIFT 100K=1.0 / GIST 10K=0.999）；**受限内存待复测** |
 | ZNS / Open-Channel 深度适配 | **未** |
 
 ---
