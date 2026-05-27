@@ -9,6 +9,7 @@
 
 #include "runtime/static_subgraph.h"
 #include "util/macros.h"
+#include "util/simd_distance.h"
 #include "util/topk.h"
 
 namespace amio {
@@ -284,23 +285,13 @@ void VectorStore::reset_search_observability() {
 float VectorStore::l2_sq(const std::vector<float> &a,
                          const std::vector<float> &b) {
   const size_t n = std::min(a.size(), b.size());
-  float s = 0.0f;
-  for (size_t i = 0; i < n; i++) {
-    const float d = a[i] - b[i];
-    s += d * d;
-  }
-  return s;
+  return amio::util::l2_sq_f32(a.data(), b.data(), n);
 }
 
 float VectorStore::l2_sq_block(const std::vector<float> &q,
                                const amio::index::NodeBlock &b, size_t dim) {
   const size_t n = std::min(dim, static_cast<size_t>(128));
-  float s = 0.0f;
-  for (size_t i = 0; i < n; i++) {
-    const float d = q[i] - b.vector[i];
-    s += d * d;
-  }
-  return s;
+  return amio::util::l2_sq_f32(q.data(), b.vector, n);
 }
 
 std::vector<SearchResult> VectorStore::search(const std::vector<float> &query,

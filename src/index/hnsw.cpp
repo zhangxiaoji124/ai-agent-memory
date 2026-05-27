@@ -6,17 +6,13 @@
 #include <unordered_set>
 
 #include "util/macros.h"
+#include "util/simd_distance.h"
 
 namespace amio::index {
 
 float HnswIndex::l2_sq(const std::vector<float> &a, const std::vector<float> &b) {
   const size_t n = std::min(a.size(), b.size());
-  float s = 0.0f;
-  for (size_t i = 0; i < n; i++) {
-    const float d = a[i] - b[i];
-    s += d * d;
-  }
-  return s;
+  return amio::util::l2_sq_f32(a.data(), b.data(), n);
 }
 
 HnswIndex::HnswIndex(size_t dim, size_t m, size_t ef_construction, uint64_t seed,
@@ -156,7 +152,8 @@ std::vector<uint64_t> HnswIndex::robust_prune(
     for (uint64_t sel : result) {
       const float dist_cs = l2_sq(vectors_[static_cast<size_t>(cand.first)],
                                   vectors_[static_cast<size_t>(sel)]);
-      if (dist_cs <= prune_alpha_ * dist_cp) {
+      // DiskANN/Vamana 遮挡：已选邻居 sel 比 center 更靠近 cand 时剪掉 cand。
+      if (prune_alpha_ * dist_cs <= dist_cp) {
         occluded = true;
         break;
       }
@@ -194,6 +191,12 @@ void HnswIndex::add_edge(int layer, uint64_t a, uint64_t b) {
     }
 
     const size_t cap = max_neighbors_for_layer(layer);
+    // 未满：直接追加，避免每条边都重跑 O(cap^2) 的 robust_prune（hnswlib/DiskANN 同款）。
+    if (lst.size() < cap) {
+      lst.push_back(y);
+      return;
+    }
+    // 已满：现有邻居 + 新点一起重剪枝，保留多样化的 cap 个。
     const auto &vx = vectors_[static_cast<size_t>(x)];
     std::vector<std::pair<uint64_t, float>> cand;
     cand.reserve(lst.size() + 1);

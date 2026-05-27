@@ -4,6 +4,8 @@
 #include <cstring>
 #include <functional>
 
+#include "util/simd_distance.h"
+
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -161,15 +163,10 @@ float ExternalVectorStore::l2_sq(const std::vector<float> &query, uint64_t node_
   if (!p) {
     return 1e30f;
   }
-  float s = 0.0f;
   if (encoding_ == VectorEncoding::Float32) {
-    const auto *vf = reinterpret_cast<const float *>(p);
-    for (uint32_t i = 0; i < dim_; i++) {
-      const float d = query[i] - vf[i];
-      s += d * d;
-    }
-    return s;
+    return amio::util::l2_sq_f32(query.data(), reinterpret_cast<const float *>(p), dim_);
   }
+  float s = 0.0f;
   for (uint32_t i = 0; i < dim_; i++) {
     const float d = query[i] - static_cast<float>(p[i]);
     s += d * d;

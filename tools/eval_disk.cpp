@@ -270,7 +270,10 @@ int main(int argc, char **argv) {
   }
 
   const size_t nbase = std::min(base_limit, base_all.size());
-  const size_t nq = std::min({query_limit, queries_all.size(), gt_all.size()});
+  // recompute_gt 时 gt_all 故意不加载（从 base 子集自算），nq 不能受其 size=0 拖累。
+  const size_t nq = recompute_gt
+                        ? std::min(query_limit, queries_all.size())
+                        : std::min({query_limit, queries_all.size(), gt_all.size()});
   std::vector<std::vector<float>> base(base_all.begin(), base_all.begin() + nbase);
 
   if (rebuild) {
@@ -349,6 +352,17 @@ int main(int argc, char **argv) {
   cfg.ram_budget_bytes = ram_budget_bytes;
   amio::runtime::apply_partition_to_config(partition, &cfg);
   cfg.ef_search = ef_search;
+
+  // 受限内存评测：直接覆盖动态/静态缓存池（MB），优先于分区推导。
+  // 把动态缓存压到远小于索引文件大小，即可制造真实的缓存未命中、激活预取/准入逻辑。
+  if (arg_value(argc, argv, "--cache-size-mb")) {
+    cfg.cache_size_mb = arg_size_t(argc, argv, "--cache-size-mb", cfg.cache_size_mb);
+  }
+  if (arg_value(argc, argv, "--static-cache-mb")) {
+    cfg.static_cache_mb = arg_size_t(argc, argv, "--static-cache-mb", cfg.static_cache_mb);
+  }
+  std::fprintf(stderr, "effective_cache: dynamic_mb=%zu static_mb=%zu\n",
+               cfg.cache_size_mb, cfg.static_cache_mb);
 
   if (mode == "baseline1") {
     // 关闭预取/缓存：贴合文档中的 Baseline-1 定义。
