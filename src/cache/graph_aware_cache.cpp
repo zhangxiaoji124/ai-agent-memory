@@ -61,8 +61,9 @@ bool GraphAwareCache::get(uint64_t node_id, amio::index::NodeBlock *out) {
   }
   auto ith = hot_.find(node_id);
   if (ith != hot_.end()) {
-    // 命中改变 tick（以及可能清除预取标志）→ 驱逐键变化，需同步更新 ev_index_。
-    ev_index_.erase({ith->second.ev_key, node_id});
+    // O(1) 命中：只更新 tick / 预取标志；ev_index_ 中的键此刻变陈旧，
+    // 不在此处做 set 增删，改由驱逐时惰性校正（lazy priority queue），
+    // 避免每次命中付 O(log n) 的有序集合手术。
     ith->second.tick = ++tick_;
     // PAIC: 需求命中预取协同加载的条目 → 有效预取
     if (ith->second.is_prefetch_loaded) {
@@ -70,9 +71,6 @@ bool GraphAwareCache::get(uint64_t node_id, amio::index::NodeBlock *out) {
       if (io_metrics_)
         io_metrics_->useful_prefetch_demand_hits.fetch_add(1, std::memory_order_relaxed);
     }
-    ith->second.ev_key = ev_key_for(ith->second.is_prefetch_loaded,
-                                    ith->second.kv_group_bytes, ith->second.tick);
-    ev_index_.insert({ith->second.ev_key, node_id});
     *out = ith->second.block;
     hits_.fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -190,20 +188,36 @@ void GraphAwareCache::set_isvm_kv_cache_enabled(bool enabled) {
 void GraphAwareCache::evict_if_needed_locked() {
   if (dynamic_capacity_bytes_ == 0)
     return;
-  // O(log n) 驱逐：ev_index_ 中 ev_key 最大者（rbegin）即 ISVM 评分最高、最该淘汰的条目。
+  // O(log n) 惰性驱逐：ev_index_ 中 ev_key 最大者（rbegin）是候选淘汰项；
+  // 因命中不再实时更新键，候选可能“陈旧”（实际更晚被访问、更不该淘汰），
+  // 此时用当前 tick/标志重算真实键、回插再重试；命中而陈旧的条目至多被校正一次。
   while (hot_used_bytes_ > dynamic_capacity_bytes_ && !ev_index_.empty()) {
     auto worst = std::prev(ev_index_.end());
+    const int64_t key_stored = worst->first;
     const uint64_t victim = worst->second;
     auto it = hot_.find(victim);
+    if (it == hot_.end()) {
+      // 孤儿索引项（理论上不出现）：直接丢弃。
+      ev_index_.erase(worst);
+      continue;
+    }
+    const int64_t key_now =
+        ev_key_for(it->second.is_prefetch_loaded, it->second.kv_group_bytes, it->second.tick);
+    if (key_now != key_stored) {
+      // 陈旧：命中后真实键已变，校正后重试（真正的最大值可能在别处）。
+      ev_index_.erase(worst);
+      it->second.ev_key = key_now;
+      ev_index_.insert({key_now, victim});
+      continue;
+    }
+    // 校验通过 → 确为 ISVM 评分最高者，执行淘汰。
     // PAIC: 驱逐仍标记为预取加载的条目 → 无效预取
-    if (it != hot_.end() && it->second.is_prefetch_loaded && io_metrics_) {
+    if (it->second.is_prefetch_loaded && io_metrics_) {
       io_metrics_->wasted_prefetch_evictions.fetch_add(1, std::memory_order_relaxed);
     }
     ev_index_.erase(worst);
-    if (it != hot_.end()) {
-      hot_.erase(it);
-      hot_used_bytes_ -= amio::index::kBlockSize;
-    }
+    hot_.erase(it);
+    hot_used_bytes_ -= amio::index::kBlockSize;
   }
 }
 
