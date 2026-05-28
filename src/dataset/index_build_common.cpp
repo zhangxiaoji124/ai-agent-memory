@@ -33,7 +33,7 @@ index::NodeBlock make_node_block(const index::HnswIndex &idx, uint32_t dim, uint
     for (size_t j = 0; j < cnt; j++) {
       const uint64_t nid = id_base + nbl[j];
       b.neighbors[static_cast<size_t>(l)][j] = static_cast<uint32_t>(nid);
-      b.neighbor_offsets[static_cast<size_t>(l)][j] = index::node_offset(nid);
+      // v3：邻居 offset 不再落盘，检索/预取时按 node_offset(nid) 推算。
     }
   }
   return b;

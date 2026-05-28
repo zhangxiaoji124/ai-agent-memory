@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -19,7 +20,7 @@ inline bool header_uses_external_vectors(const IndexFileHeader &h) {
 }
 
 inline uint64_t default_vector_section_offset(uint64_t total_nodes) {
-  return kBlockSize * (1 + total_nodes);
+  return kHeaderSize + total_nodes * kBlockSize;
 }
 
 class ExternalVectorStore {

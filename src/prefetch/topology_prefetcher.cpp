@@ -99,7 +99,7 @@ void TopologyPrefetcher::on_visit_node(const amio::index::NodeBlock &node,
       const size_t n = std::min(static_cast<size_t>(cnt), max_fan);
       for (size_t i = 0; i < n; i++) {
         const uint64_t nid = static_cast<uint64_t>(node.neighbors[layer][i]);
-        const uint64_t off = node.neighbor_offsets[layer][i];
+        const uint64_t off = amio::index::node_offset(nid); // v3：按 id 推算 offset
         tagged.push_back({off, nid});
       }
     } else {
@@ -109,7 +109,7 @@ void TopologyPrefetcher::on_visit_node(const amio::index::NodeBlock &node,
                                 : (cnt > 32 ? 32 : cnt);
         for (size_t i = 0; i < n; i++) {
           const uint64_t nid = static_cast<uint64_t>(node.neighbors[l][i]);
-          const uint64_t off = node.neighbor_offsets[l][i];
+          const uint64_t off = amio::index::node_offset(nid); // v3：按 id 推算 offset
           tagged.push_back({off, nid});
         }
       }

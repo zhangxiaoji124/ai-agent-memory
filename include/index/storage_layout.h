@@ -6,10 +6,12 @@
 
 namespace amio::index {
 
-constexpr size_t kBlockSize = 4096;
+constexpr size_t kHeaderSize = 4096; // 文件头固定占首个 4KB 块
+constexpr size_t kBlockSize = 2048;  // v3 瘦身 NodeBlock：去除可由 node_id 推算的 neighbor_offsets（4KB→2KB）
 constexpr uint64_t kMagic = 0x5844494D45474D41ULL; // "AGMEMIDX" (little-endian-ish)
 constexpr uint32_t kIndexVersion1 = 1;           // 向量内联 NodeBlock（dim≤128）
 constexpr uint32_t kIndexVersion2 = 2;           // 向量外置连续区（任意 dim，如 960）
+constexpr uint32_t kIndexVersion3 = 3;           // 瘦身块（2KB，offset 由 node_id 推算）
 constexpr uint32_t kMaxInlineVectorDim = 128;
 
 #pragma pack(push, 1)
@@ -23,7 +25,7 @@ struct alignas(4096) IndexFileHeader {
   uint32_t m = 16;
   uint32_t dim = 128;
   uint64_t entry_point = 0;
-  uint64_t high_layer_end_offset = kBlockSize;
+  uint64_t high_layer_end_offset = kHeaderSize;
   /// v2：向量区在文件中的起始偏移；0 表示 v1 内联于 NodeBlock。
   uint64_t vector_section_offset = 0;
   /// 每条向量字节数（float32: dim*4；uint8: dim）。
@@ -33,9 +35,9 @@ struct alignas(4096) IndexFileHeader {
   uint8_t _pad_hdr[3]{};
   uint8_t _reserved[4024]{};
 };
-static_assert(sizeof(IndexFileHeader) == kBlockSize);
+static_assert(sizeof(IndexFileHeader) == kHeaderSize);
 
-struct alignas(4096) NodeBlock {
+struct alignas(2048) NodeBlock {
   uint64_t node_id = 0;
   uint8_t layer = 0;
   uint8_t neighbor_counts[8]{};
@@ -43,14 +45,15 @@ struct alignas(4096) NodeBlock {
   uint8_t _reserved_header[45]{};
   float vector[128]{};
   uint32_t neighbors[8][32]{};
-  uint64_t neighbor_offsets[8][32]{};
+  // v3：邻居磁盘 offset 不再落盘，按需用 node_offset(neighbor_id) 推算。
   uint8_t _padding[448]{};
 };
 static_assert(sizeof(NodeBlock) == kBlockSize);
 #pragma pack(pop)
 
+/// 节点 node_id 在文件中的字节偏移：头部固定 kHeaderSize，其后每个节点占 kBlockSize。
 inline uint64_t node_offset(uint64_t node_id) {
-  return static_cast<uint64_t>(kBlockSize) +
+  return static_cast<uint64_t>(kHeaderSize) +
          node_id * static_cast<uint64_t>(kBlockSize);
 }
 

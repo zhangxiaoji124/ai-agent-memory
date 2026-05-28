@@ -10,6 +10,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "index/external_vectors.h"
 #include "index/storage_layout.h"
 
 #if defined(_WIN32)
@@ -196,7 +197,7 @@ bool reorder_index_bfs(const std::string &src_path, const std::string &dst_path,
         if (old_nb < N) {
           const uint64_t new_nb = old_to_new[static_cast<size_t>(old_nb)];
           nb.neighbors[static_cast<size_t>(lyr)][j] = static_cast<uint32_t>(new_nb);
-          nb.neighbor_offsets[static_cast<size_t>(lyr)][j] = index::node_offset(new_nb);
+          // v3：邻居 offset 按 node_offset(new_nb) 推算，不再落盘。
         }
       }
     }
@@ -431,7 +432,7 @@ bool reorder_index_gorder(const std::string &src_path, const std::string &dst_pa
         if (old_nb < N) {
           const uint64_t new_nb = old_to_new[static_cast<size_t>(old_nb)];
           nb.neighbors[static_cast<size_t>(lyr)][j] = static_cast<uint32_t>(new_nb);
-          nb.neighbor_offsets[static_cast<size_t>(lyr)][j] = index::node_offset(new_nb);
+          // v3：邻居 offset 按 node_offset(new_nb) 推算，不再落盘。
         }
       }
     }
