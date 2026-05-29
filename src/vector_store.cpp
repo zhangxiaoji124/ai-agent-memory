@@ -48,10 +48,18 @@ disk_search_layer(index::IndexFile &file, cache::GraphAwareCache &cache,
                   uint64_t total_nodes,
                   float (*dist_block)(const std::vector<float> &, const index::NodeBlock &,
                                       size_t),
-                  const policy::AgentIoPolicy *pol, IoMetrics *io_metrics) {
+                  const policy::AgentIoPolicy *pol, IoMetrics *io_metrics,
+                  const index::ProductQuantizer *pq, const std::vector<uint8_t> *pq_codes,
+                  const std::vector<float> *pq_lut) {
   struct Item {
     float d;
     uint64_t id;
+  };
+  // PQ 启用时用 ADC 查表近似距离（驻留内存，不读全精度向量）；否则全精度。
+  auto node_dist = [&](uint64_t id, const index::NodeBlock &blk) -> float {
+    if (pq && pq_codes && pq_lut)
+      return pq->adc_distance(pq_codes->data() + static_cast<size_t>(id) * pq->m(), *pq_lut);
+    return (ext_vecs && ext_vecs->ok()) ? ext_vecs->l2_sq(q, id) : dist_block(q, blk, dim);
   };
   auto cmp_min = [](const Item &a, const Item &b) { return a.d > b.d; };
   auto cmp_max = [](const Item &a, const Item &b) { return a.d < b.d; };
@@ -85,8 +93,7 @@ disk_search_layer(index::IndexFile &file, cache::GraphAwareCache &cache,
   visited.insert(ep);
   ++visited_count;
 
-  const float d0 =
-      (ext_vecs && ext_vecs->ok()) ? ext_vecs->l2_sq(q, ep) : dist_block(q, epb, dim);
+  const float d0 = node_dist(ep, epb);
   candidates.push(Item{d0, ep});
   topk.push(Item{d0, ep});
 
@@ -121,8 +128,7 @@ disk_search_layer(index::IndexFile &file, cache::GraphAwareCache &cache,
         index::NodeBlock nbk{};
         if (!cache.get_or_load(&file, uring, nb, &nbk))
           continue;
-        const float d = (ext_vecs && ext_vecs->ok()) ? ext_vecs->l2_sq(q, nb)
-                                                     : dist_block(q, nbk, dim);
+        const float d = node_dist(nb, nbk);
         if (topk.size() < ef || d < topk.top().d) {
           candidates.push(Item{d, nb});
           topk.push(Item{d, nb});
@@ -205,6 +211,32 @@ bool VectorStore::open() {
       std::fprintf(stderr, "external vectors: dim=%u stride=%u enc=%u\n", header_.dim,
                    header_.vector_stride_bytes,
                    static_cast<unsigned>(header_.vector_encoding));
+    }
+  }
+
+  // PQ：若存在 <index>.pq 码本 + <index>.pqcodes 码，则加载进内存启用 ADC 检索。
+  pq_.reset();
+  pq_codes_.clear();
+  {
+    auto pq = std::make_unique<index::ProductQuantizer>();
+    if (pq->load(cfg_.index_path + ".pq") && pq->dim() == header_.dim && pq->m() > 0) {
+      std::FILE *cf = std::fopen((cfg_.index_path + ".pqcodes").c_str(), "rb");
+      if (cf) {
+        uint64_t ncodes = 0;
+        if (std::fread(&ncodes, sizeof(uint64_t), 1, cf) == 1 &&
+            ncodes == header_.total_nodes) {
+          pq_codes_.resize(static_cast<size_t>(ncodes) * pq->m());
+          if (std::fread(pq_codes_.data(), 1, pq_codes_.size(), cf) == pq_codes_.size()) {
+            pq_ = std::move(pq);
+            std::fprintf(stderr, "pq: enabled m=%u codes=%lluMB centroids=%lluKB\n", pq_->m(),
+                         static_cast<unsigned long long>(pq_codes_.size() / (1024 * 1024)),
+                         static_cast<unsigned long long>(pq_->centroids_bytes() / 1024));
+          } else {
+            pq_codes_.clear();
+          }
+        }
+        std::fclose(cf);
+      }
     }
   }
 
@@ -411,6 +443,17 @@ std::vector<SearchResult> VectorStore::search_disk(const std::vector<float> &que
   if (query.size() != dim)
     return out;
 
+  // PQ：启用时遍历用 ADC 查表近似距离（驻留内存），最后对候选全精度重排。
+  std::vector<float> pq_lut;
+  const index::ProductQuantizer *pqp = nullptr;
+  const std::vector<uint8_t> *codesp = nullptr;
+  if (uses_pq() && pq_->dim() == header_.dim) {
+    pq_->compute_lut(query.data(), &pq_lut);
+    pqp = pq_.get();
+    codesp = &pq_codes_;
+  }
+  const std::vector<float> *lutp = pq_lut.empty() ? nullptr : &pq_lut;
+
   uint64_t ep = header_.entry_point;
   if (ep >= total_nodes)
     ep = 0;
@@ -419,7 +462,7 @@ std::vector<SearchResult> VectorStore::search_disk(const std::vector<float> &que
   for (int lc = ml; lc > 0; lc--) {
     auto w = disk_search_layer(file_, cache_, uring_.get(), prefetch_, ext_vecs_.get(), ep,
                                query, 1, lc, dim, total_nodes, &VectorStore::l2_sq_block,
-                               nullptr, nullptr);
+                               nullptr, nullptr, pqp, codesp, lutp);
     if (!w.empty())
       ep = pick_closest(w);
   }
@@ -428,9 +471,26 @@ std::vector<SearchResult> VectorStore::search_disk(const std::vector<float> &que
   auto w0 =
       disk_search_layer(file_, cache_, uring_.get(), prefetch_, ext_vecs_.get(), ep, query,
                         cfg_.ef_search, 0, dim, total_nodes, &VectorStore::l2_sq_block,
-                        &io_policy_, &io_metrics_);
+                        &io_policy_, &io_metrics_, pqp, codesp, lutp);
   std::sort(w0.begin(), w0.end(),
             [](const auto &a, const auto &b) { return a.second < b.second; });
+
+  // PQ 重排：取 ADC top-(k*mult) 候选，重算全精度 L2 后再排，找回召回。
+  if (pqp) {
+    const size_t rn = std::min(w0.size(), std::max(k, k * std::max<size_t>(1, cfg_.pq_rerank_mult)));
+    w0.resize(rn);
+    for (auto &p : w0) {
+      if (ext_vecs_ && ext_vecs_->ok()) {
+        p.second = ext_vecs_->l2_sq(query, p.first);
+      } else {
+        index::NodeBlock b{};
+        if (cache_.get_or_load(&file_, uring_.get(), p.first, &b))
+          p.second = l2_sq_block(query, b, dim);
+      }
+    }
+    std::sort(w0.begin(), w0.end(),
+              [](const auto &a, const auto &b) { return a.second < b.second; });
+  }
   if (w0.size() > k)
     w0.resize(k);
 

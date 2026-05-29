@@ -10,6 +10,7 @@
 #include "cache/graph_aware_cache.h"
 #include "index/external_vectors.h"
 #include "index/hnsw.h"
+#include "index/pq.h"
 #include "index/storage_layout.h"
 #include "policy/agent_io_policy.h"
 #include "prefetch/io_uring_backend.h"
@@ -57,6 +58,8 @@ struct Config {
   bool force_disable_uring = false;
   size_t memtable_limit_mb = 64;
   size_t ef_search = 128;
+  /// PQ 检索：>0 时若存在 `<index>.pq` 码本则启用 ADC 粗筛 + 全精度重排。
+  size_t pq_rerank_mult = 8; // 重排候选数 = k * 该倍数
   /// 可选：离线学习的 Agent I/O 策略 JSON（见 `learning/train_agent_policy.py`）。
   std::string agent_policy_path;
   /// `Learned` 且路径非空时合并 JSON；`Builtin` 时忽略路径（基线对照）。
@@ -102,12 +105,17 @@ public:
   bool uses_external_vectors() const {
     return ext_vecs_ && ext_vecs_->ok();
   }
+  bool uses_pq() const { return pq_ && pq_->ok() && !pq_codes_.empty(); }
 
 private:
   Config cfg_;
   index::IndexFile file_;
   index::IndexFileHeader header_{};
   std::unique_ptr<index::ExternalVectorStore> ext_vecs_;
+
+  // PQ：码本（驻留内存）+ 全部码（每节点 m 字节，驻留内存）。启用时检索走 ADC 粗筛 + 重排。
+  std::unique_ptr<index::ProductQuantizer> pq_;
+  std::vector<uint8_t> pq_codes_;
 
   mutable std::mutex index_mu_;
   index::HnswIndex index_;

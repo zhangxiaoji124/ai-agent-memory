@@ -16,6 +16,7 @@
 #include "dataset/vector_dataset.h"
 #include "index/external_vectors.h"
 #include "index/hnsw.h"
+#include "index/pq.h"
 #include "index/storage_layout.h"
 #include "runtime/memory_partition.h"
 #include "util/time.h"
@@ -292,6 +293,38 @@ int main(int argc, char **argv) {
     if (!built) {
       std::fprintf(stderr, "构建索引失败: %s\n", index_path.c_str());
       return 5;
+    }
+  }
+
+  // PQ 旁路文件：--pq-m>0 时训练码本 + 编码全部 base，写 <index>.pq / <index>.pqcodes。
+  // VectorStore::open 检测到该旁路文件即启用 ADC 粗筛 + 全精度重排。
+  const size_t pq_m = arg_size_t(argc, argv, "--pq-m", 0);
+  if (pq_m > 0 && rebuild && !base.empty()) {
+    const uint32_t pdim = static_cast<uint32_t>(base[0].size());
+    if (pdim % static_cast<uint32_t>(pq_m) != 0) {
+      std::fprintf(stderr, "pq: dim(%u) %% m(%zu) != 0, skip\n", pdim, pq_m);
+    } else {
+      amio::index::ProductQuantizer pq;
+      if (pq.train(base, pdim, static_cast<uint32_t>(pq_m), 25, 100000, 42) &&
+          pq.save(index_path + ".pq")) {
+        std::FILE *cf = std::fopen((index_path + ".pqcodes").c_str(), "wb");
+        if (cf) {
+          const uint64_t ncodes = base.size();
+          std::fwrite(&ncodes, sizeof(uint64_t), 1, cf);
+          std::vector<uint8_t> code(pq_m);
+          for (const auto &v : base) {
+            pq.encode(v.data(), code.data());
+            std::fwrite(code.data(), 1, pq_m, cf);
+          }
+          std::fclose(cf);
+          std::fprintf(stderr, "pq sidecar: m=%zu n=%llu codes=%lluMB -> %s\n", pq_m,
+                       static_cast<unsigned long long>(ncodes),
+                       static_cast<unsigned long long>(ncodes * pq_m / (1024 * 1024)),
+                       (index_path + ".pq").c_str());
+        }
+      } else {
+        std::fprintf(stderr, "pq train/save failed\n");
+      }
     }
   }
 
