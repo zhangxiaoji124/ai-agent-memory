@@ -388,6 +388,9 @@ void VectorStore::on_compaction_applied(const write::IndexMergeStats &st) {
 }
 
 void VectorStore::flush_writes() {
+  // 注意：写链路 compaction/merge 为骨架，merge_batch_into_index 存在已知缺陷
+  // （new_total/局部-全局 id 映射），暂不在此 drain MemTable（否则会触发 merge 崩溃）。
+  // 待写路径重写后再恢复"flush 时排空 MemTable"。详见 docs 写链路成熟度说明。
   if (cfg_.enable_nvtable && !nvtable_.empty()) {
     submit_compaction_batch(nvtable_.drain_all());
   }

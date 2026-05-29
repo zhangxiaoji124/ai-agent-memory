@@ -30,6 +30,7 @@ add_library(amio
   src/dataset/index_builder.cpp
   src/dataset/index_build_common.cpp
   src/index/external_vectors.cpp
+  src/index/pq.cpp
   src/runtime/memory_partition.cpp
   src/runtime/static_subgraph.cpp
   src/runtime/graph_reorder.cpp
@@ -62,6 +63,7 @@ endif()
 
 add_executable(run_tests
   tests/main.cpp
+  tests/pq_test.cpp
   tests/recall_test.cpp
   tests/disk_roundtrip_test.cpp
   tests/concurrent_test.cpp
