@@ -305,7 +305,8 @@ int main(int argc, char **argv) {
       std::fprintf(stderr, "pq: dim(%u) %% m(%zu) != 0, skip\n", pdim, pq_m);
     } else {
       amio::index::ProductQuantizer pq;
-      if (pq.train(base, pdim, static_cast<uint32_t>(pq_m), 25, 100000, 42) &&
+      // 训练参数：12 次迭代 + 25k 采样足够稳定 256 个中心，远快于全量×25。
+      if (pq.train(base, pdim, static_cast<uint32_t>(pq_m), 12, 25000, 42) &&
           pq.save(index_path + ".pq")) {
         std::FILE *cf = std::fopen((index_path + ".pqcodes").c_str(), "wb");
         if (cf) {

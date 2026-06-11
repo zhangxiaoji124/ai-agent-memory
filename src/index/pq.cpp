@@ -53,25 +53,35 @@ bool ProductQuantizer::train(const std::vector<std::vector<float>> &data, uint32
   std::vector<uint32_t> assign(nt, 0);
   std::vector<double> sum(static_cast<size_t>(ksub_) * sub_dim_, 0.0);
   std::vector<uint32_t> cnt(ksub_, 0);
+  // 每个子空间把采样子向量拍平成连续缓冲（sub[i*sub_dim..]），消除
+  // vector<vector<float>> 的散列访问，使 k-means 内循环全程顺序读（缓存友好）。
+  std::vector<float> sub(static_cast<size_t>(nt) * sub_dim_);
 
   for (uint32_t s = 0; s < m_; s++) {
     const uint32_t off = s * sub_dim_;
     float *cents = centroids_.data() + static_cast<size_t>(s) * ksub_ * sub_dim_;
 
+    for (size_t i = 0; i < nt; i++) {
+      std::memcpy(sub.data() + i * sub_dim_, data[idx[i]].data() + off,
+                  sub_dim_ * sizeof(float));
+    }
+
     // 初始化：随机取 ksub 个样本子向量作为初始中心。
     {
-      std::vector<uint32_t> init = idx;
+      std::vector<uint32_t> init(nt);
+      for (size_t i = 0; i < nt; i++) init[i] = static_cast<uint32_t>(i);
       std::shuffle(init.begin(), init.end(), rng);
       for (uint32_t c = 0; c < ksub_; c++) {
-        const float *src = data[init[c]].data() + off;
-        std::memcpy(cents + static_cast<size_t>(c) * sub_dim_, src, sub_dim_ * sizeof(float));
+        std::memcpy(cents + static_cast<size_t>(c) * sub_dim_,
+                    sub.data() + static_cast<size_t>(init[c]) * sub_dim_,
+                    sub_dim_ * sizeof(float));
       }
     }
 
     for (uint32_t it = 0; it < iters; it++) {
       // 分配
       for (size_t i = 0; i < nt; i++) {
-        const float *v = data[idx[i]].data() + off;
+        const float *v = sub.data() + i * sub_dim_;
         float best = std::numeric_limits<float>::max();
         uint32_t bc = 0;
         for (uint32_t c = 0; c < ksub_; c++) {
@@ -88,7 +98,7 @@ bool ProductQuantizer::train(const std::vector<std::vector<float>> &data, uint32
       std::fill(cnt.begin(), cnt.end(), 0u);
       for (size_t i = 0; i < nt; i++) {
         const uint32_t c = assign[i];
-        const float *v = data[idx[i]].data() + off;
+        const float *v = sub.data() + i * sub_dim_;
         double *acc = sum.data() + static_cast<size_t>(c) * sub_dim_;
         for (uint32_t d = 0; d < sub_dim_; d++) {
           acc[d] += v[d];
@@ -100,7 +110,7 @@ bool ProductQuantizer::train(const std::vector<std::vector<float>> &data, uint32
         float *cc = cents + static_cast<size_t>(c) * sub_dim_;
         if (cnt[c] == 0) {
           // 空簇：重置到随机样本子向量。
-          const float *v = data[idx[rpick(rng)]].data() + off;
+          const float *v = sub.data() + rpick(rng) * sub_dim_;
           std::memcpy(cc, v, sub_dim_ * sizeof(float));
         } else {
           const double inv = 1.0 / static_cast<double>(cnt[c]);
